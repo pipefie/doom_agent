@@ -1,7 +1,7 @@
 import argparse
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Tuple
 
@@ -14,7 +14,6 @@ import torch.optim as optim
 import vizdoom as vzd
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
-import time 
 
 
 # =========================
@@ -24,14 +23,65 @@ import time
 @dataclass
 class DoomConfig:
     scenario_cfg: str
+    scenario_name: str = "basic"
     frame_skip: int = 4
     frame_width: int = 84
     frame_height: int = 84
     frame_stack: int = 4
     grayscale: bool = True
-    # Reward shaping parameters (can be tuned later)
+    use_shared_actions: bool = True
+    # Reward shaping parameters (tuned per-scenario by CLI)
     kill_reward: float = 5.0
     ammo_penalty: float = 0.01
+    progress_scale: float = 0.0
+    health_penalty: float = 0.0
+    death_penalty: float = 0.0
+
+
+# Scenario helpers so CLI users can pick stages by name and inherit sensible defaults.
+SCENARIO_CFG_MAP = {
+    "basic": "configs/basic.cfg",
+    "defend_the_center": "configs/defend_the_center.cfg",
+    "deadly_corridor": "configs/deadly_corridor.cfg",
+}
+
+# Reward shaping defaults are intentionally light for early tasks and richer for Deadly Corridor.
+SCENARIO_SHAPING_DEFAULTS = {
+    "basic": {
+        "kill_reward": 5.0,
+        "ammo_penalty": 0.01,
+        "progress_scale": 0.0,
+        "health_penalty": 0.0,
+        "death_penalty": 0.0,
+    },
+    "defend_the_center": {
+        "kill_reward": 5.0,
+        "ammo_penalty": 0.01,
+        "progress_scale": 0.0,
+        "health_penalty": 0.0,
+        "death_penalty": 0.0,
+    },
+    "deadly_corridor": {
+        # Stronger shaping to offset sparse rewards and punish early suicides.
+        "kill_reward": 10.0,
+        "ammo_penalty": 0.02,
+        "progress_scale": 0.05,  # Reward forward motion down the corridor.
+        "health_penalty": 0.05,
+        "death_penalty": 5.0,
+    },
+}
+
+# Unified action set used across scenarios so checkpoint heads always match.
+# This is the superset of buttons required by Deadly Corridor and works in earlier tasks too.
+SHARED_ACTION_BUTTONS = [
+    vzd.Button.MOVE_FORWARD,
+    vzd.Button.MOVE_BACKWARD,
+    vzd.Button.TURN_LEFT,
+    vzd.Button.TURN_RIGHT,
+    vzd.Button.MOVE_LEFT,
+    vzd.Button.MOVE_RIGHT,
+    vzd.Button.ATTACK,
+]
 
 
 # =========================
@@ -45,8 +95,10 @@ class VizDoomGymnasiumEnv(gym.Env):
     - Returns observations as stacked grayscale frames: (C, H, W),
       where C = frame_stack.
     - Uses Gymnasium API: step() -> (obs, reward, terminated, truncated, info).
-    - Includes a SIMPLE reward shaping hook (kill reward + ammo usage penalty),
-      which you can tune or extend for Deadly Corridor.
+    - Reward shaping is scenario-aware:
+        * Basic / Defend the Center → kill reward + ammo penalty
+        * Deadly Corridor → adds progress along the corridor, health penalties,
+          and a small optional death penalty to avoid the suicide trap.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -55,11 +107,17 @@ class VizDoomGymnasiumEnv(gym.Env):
         super().__init__()
         assert render_mode in (None, "human")
         self.cfg = cfg
+        self.scenario_name = (cfg.scenario_name or "basic").lower()
         self.render_mode = render_mode
 
         # Initialize Doom game
         self.game = vzd.DoomGame()
         self.game.load_config(self.cfg.scenario_cfg)
+        if self.cfg.use_shared_actions:
+            # Force a consistent action list across scenarios so policy heads stay compatible
+            # when loading checkpoints during curriculum transfers.
+            self.game.set_available_buttons(SHARED_ACTION_BUTTONS)
+        self._register_shaping_variables()
         self.game.init()
 
         # Define action space based on available buttons
@@ -84,16 +142,48 @@ class VizDoomGymnasiumEnv(gym.Env):
 
         # Game variables for reward shaping
         self.available_vars = self.game.get_available_game_variables()
-        self.kill_idx = None
-        self.ammo_idx = None
-        for i, var in enumerate(self.available_vars):
-            if var == vzd.GameVariable.KILLCOUNT:
-                self.kill_idx = i
-            if var == vzd.GameVariable.AMMO2:  # often used for shotgun
-                self.ammo_idx = i
+        self.kill_idx = self._find_var_index(vzd.GameVariable.KILLCOUNT)
+        self.ammo_idx = self._find_var_index(vzd.GameVariable.AMMO2)
+        self.progress_idx = self._find_var_index(vzd.GameVariable.POSITION_X)
+        self.health_idx = self._find_var_index(vzd.GameVariable.HEALTH)
 
         self.prev_killcount = 0.0
         self.prev_ammo = 0.0
+        self.prev_posx = 0.0
+        self.prev_health = 0.0
+
+    def _register_shaping_variables(self):
+        """
+        Ensure the game exposes the variables we need for shaping.
+        We add them before init() so ViZDoom will track them in get_state().
+        """
+        current = set(self.game.get_available_game_variables())
+        requested = []
+
+        if self.cfg.kill_reward != 0.0 and vzd.GameVariable.KILLCOUNT not in current:
+            requested.append(vzd.GameVariable.KILLCOUNT)
+        if self.cfg.ammo_penalty != 0.0 and vzd.GameVariable.AMMO2 not in current:
+            requested.append(vzd.GameVariable.AMMO2)
+
+        # Deadly Corridor (or any scenario using progress/health penalties) needs more signals.
+        if self.scenario_name == "deadly_corridor" or self.cfg.progress_scale != 0.0:
+            if vzd.GameVariable.POSITION_X not in current:
+                requested.append(vzd.GameVariable.POSITION_X)
+        if self.cfg.health_penalty != 0.0 or self.scenario_name == "deadly_corridor":
+            if vzd.GameVariable.HEALTH not in current:
+                requested.append(vzd.GameVariable.HEALTH)
+
+        for var in requested:
+            self.game.add_available_game_variable(var)
+
+    def _find_var_index(self, target_var: vzd.GameVariable) -> int | None:
+        """
+        Return the index of target_var in the game's available variables list, or None.
+        """
+        for i, var in enumerate(self.available_vars):
+            if var == target_var:
+                return i
+        return None
 
     def _process_frame(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -157,21 +247,29 @@ class VizDoomGymnasiumEnv(gym.Env):
             self.prev_killcount = float(vars_[self.kill_idx])
         if self.ammo_idx is not None:
             self.prev_ammo = float(vars_[self.ammo_idx])
+        if self.progress_idx is not None:
+            self.prev_posx = float(vars_[self.progress_idx])
+        if self.health_idx is not None:
+            self.prev_health = float(vars_[self.health_idx])
 
     def _shape_reward(
         self,
         base_reward: float,
         state: vzd.GameState | None,
+        terminated: bool,
     ) -> float:
         """
-        Simple reward shaping:
+        Reward shaping:
         - +kill_reward * (delta_killcount)
         - -ammo_penalty * (ammo_used)
-        This helps discourage suicidal policies in sparse settings by rewarding kills
-        and discouraging ammo spam. You can tune these later.
+        - +progress_scale * (delta POSITION_X) for Deadly Corridor
+        - -health_penalty * (health lost)
+        - Optional death_penalty on episode end to discourage intentional suicides
         """
         shaped = base_reward
         if state is None:
+            if terminated and self.cfg.death_penalty != 0.0:
+                shaped -= self.cfg.death_penalty
             return shaped
 
         vars_ = state.game_variables
@@ -189,6 +287,23 @@ class VizDoomGymnasiumEnv(gym.Env):
             if ammo_used > 0:
                 shaped -= self.cfg.ammo_penalty * ammo_used
             self.prev_ammo = ammo
+
+        # Progress shaping (Deadly Corridor): reward forward movement along X-axis.
+        if self.progress_idx is not None and self.cfg.progress_scale != 0.0:
+            posx = float(vars_[self.progress_idx])
+            delta_x = posx - self.prev_posx
+            # Negative delta_x naturally produces a penalty; no separate hyperparameter.
+            if delta_x != 0.0:
+                shaped += self.cfg.progress_scale * delta_x
+            self.prev_posx = posx
+
+        # Health shaping: penalize health loss to discourage reckless damage intake.
+        if self.health_idx is not None and self.cfg.health_penalty != 0.0:
+            health = float(vars_[self.health_idx])
+            lost = self.prev_health - health
+            if lost > 0.0:
+                shaped -= self.cfg.health_penalty * lost
+            self.prev_health = health
 
         return shaped
 
@@ -244,7 +359,7 @@ class VizDoomGymnasiumEnv(gym.Env):
             info = {}
 
         # Reward shaping: adjust reward before returning
-        reward = self._shape_reward(float(base_reward), state)
+        reward = self._shape_reward(float(base_reward), state, terminated)
 
         return obs, reward, terminated, truncated, info
 
@@ -261,13 +376,14 @@ class VizDoomGymnasiumEnv(gym.Env):
 # 3. Env factory (vectorized)
 # =========================
 
-def make_vizdoom_env(cfg_path: str, seed: int, idx: int, render: bool = False):
+def make_vizdoom_env(base_cfg: DoomConfig, seed: int, idx: int, render: bool = False):
     """
     Returns a thunk to create a single env instance, for use with SyncVectorEnv.
     """
     def thunk():
+        env_cfg = DoomConfig(**asdict(base_cfg))
         env = VizDoomGymnasiumEnv(
-            DoomConfig(scenario_cfg=cfg_path),
+            env_cfg,
             render_mode=("human" if render and idx == 0 else None),
         )
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -276,11 +392,11 @@ def make_vizdoom_env(cfg_path: str, seed: int, idx: int, render: bool = False):
     return thunk
 
 
-def make_envs(args):
+def make_envs(args, doom_cfg: DoomConfig):
     return gym.vector.SyncVectorEnv(
         [
             make_vizdoom_env(
-                cfg_path=args.scenario_cfg,
+                base_cfg=doom_cfg,
                 seed=args.seed,
                 idx=i,
                 render=args.render,
@@ -383,6 +499,10 @@ def parse_args():
     # Env & Doom
     parser.add_argument("--scenario-cfg", type=str, default="configs/basic.cfg",
                         help="Path to ViZDoom .cfg scenario")
+    parser.add_argument("--scenario-name", type=str, default=None,
+                        help="Scenario name shortcut; overrides --scenario-cfg when provided")
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="Path to a .pt checkpoint to warm start model+optimizer")
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--num-steps", type=int, default=128,
                         help="Number of environment steps per update (per env)")
@@ -390,6 +510,20 @@ def parse_args():
 
     parser.add_argument("--render", action="store_true", help="Render first env window")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use-shared-actions", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use a unified action set across scenarios to keep policy heads compatible")
+
+    # Reward shaping (scenario defaults kick in when args are left None)
+    parser.add_argument("--kill-reward", type=float, default=None,
+                        help="Extra reward per enemy kill (delta KILLCOUNT)")
+    parser.add_argument("--ammo-penalty", type=float, default=None,
+                        help="Penalty per ammo used (AMMO2 delta)")
+    parser.add_argument("--progress-scale", type=float, default=None,
+                        help="Scale for POSITION_X progress reward (Deadly Corridor)")
+    parser.add_argument("--health-penalty", type=float, default=None,
+                        help="Penalty per point of health lost")
+    parser.add_argument("--death-penalty", type=float, default=None,
+                        help="Additional penalty when dying early")
 
     # PPO hyperparameters
     parser.add_argument("--learning-rate", type=float, default=2.5e-4)
@@ -433,6 +567,48 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Scenario resolution and reward shaping defaults
+    if args.scenario_name:
+        scenario_name = args.scenario_name.lower().replace("-", "_")
+        if scenario_name in SCENARIO_CFG_MAP:
+            args.scenario_cfg = SCENARIO_CFG_MAP[scenario_name]
+        else:
+            raise ValueError(f"Unknown scenario name: {args.scenario_name}")
+    else:
+        scenario_name = os.path.splitext(os.path.basename(args.scenario_cfg))[0].lower()
+        scenario_name = scenario_name.replace("-", "_")
+    args.scenario_name = scenario_name
+
+    if not os.path.isfile(args.scenario_cfg):
+        raise FileNotFoundError(f"Scenario cfg not found: {args.scenario_cfg}")
+
+    defaults = SCENARIO_SHAPING_DEFAULTS.get(
+        scenario_name, SCENARIO_SHAPING_DEFAULTS["basic"]
+    )
+    # Fill in shaping hyperparameters; None means "use scenario default".
+    args.kill_reward = defaults["kill_reward"] if args.kill_reward is None else args.kill_reward
+    args.ammo_penalty = defaults["ammo_penalty"] if args.ammo_penalty is None else args.ammo_penalty
+    args.progress_scale = defaults["progress_scale"] if args.progress_scale is None else args.progress_scale
+    args.health_penalty = defaults["health_penalty"] if args.health_penalty is None else args.health_penalty
+    args.death_penalty = defaults["death_penalty"] if args.death_penalty is None else args.death_penalty
+
+    doom_cfg = DoomConfig(
+        scenario_cfg=args.scenario_cfg,
+        scenario_name=scenario_name,
+        use_shared_actions=args.use_shared_actions,
+        kill_reward=args.kill_reward,
+        ammo_penalty=args.ammo_penalty,
+        progress_scale=args.progress_scale,
+        health_penalty=args.health_penalty,
+        death_penalty=args.death_penalty,
+    )
+
+    print(f"[INFO] Scenario '{scenario_name}' using cfg={args.scenario_cfg}")
+    print("[INFO] Reward shaping "
+          f"(kill={doom_cfg.kill_reward}, ammo_penalty={doom_cfg.ammo_penalty}, "
+          f"progress_scale={doom_cfg.progress_scale}, health_penalty={doom_cfg.health_penalty}, "
+          f"death_penalty={doom_cfg.death_penalty})")
+
     # Basic asserts & setup
     assert args.num_steps > 0
     assert args.num_envs > 0
@@ -453,13 +629,26 @@ def main():
         torch.backends.cudnn.benchmark = False
 
     # Envs
-    envs = make_envs(args)
+    envs = make_envs(args, doom_cfg)
     obs_space = envs.single_observation_space
     act_space = envs.single_action_space
 
     # Agent
     agent = PPOAgent(obs_space, act_space).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+    # Optional warm start for curriculum or resuming training
+    global_step = 0
+    if args.load_checkpoint is not None:
+        if not os.path.isfile(args.load_checkpoint):
+            raise FileNotFoundError(f"Checkpoint not found: {args.load_checkpoint}")
+        checkpoint = torch.load(args.load_checkpoint, map_location=device)
+        agent.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        global_step = int(checkpoint.get("global_step", 0))
+        print(f"[INFO] Loaded checkpoint from {args.load_checkpoint} "
+              f"(global_step={global_step})")
 
     # Logging
     run_name = (
@@ -485,7 +674,7 @@ def main():
     dones = np.zeros((args.num_steps, args.num_envs), dtype=np.bool_)
     values = np.zeros((args.num_steps, args.num_envs), dtype=np.float32)
 
-    global_step = 0
+    initial_global_step = global_step
     start_time = time.time()
 
     next_obs, _ = envs.reset()
@@ -493,7 +682,8 @@ def main():
 
     num_updates = args.total_timesteps // batch_size
 
-    print(f"[INFO] Starting training for {args.total_timesteps} timesteps, "
+    print(f"[INFO] Starting training from global_step={global_step} "
+          f"for {args.total_timesteps} timesteps, "
           f"{num_updates} updates, batch_size={batch_size}, minibatch_size={minibatch_size}.")
 
     for update in range(1, num_updates + 1):
@@ -659,7 +849,8 @@ def main():
             writer.add_scalar("charts/explained_variance", explained_var, global_step)
 
         if update % 10 == 0 or update == num_updates:
-            fps = int(global_step / (time.time() - start_time))
+            steps_this_run = max(global_step - initial_global_step, 1)
+            fps = int(steps_this_run / (time.time() - start_time))
             print(
                 f"[UPDATE {update}/{num_updates}] "
                 f"global_step={global_step} | fps={fps} | "
@@ -689,7 +880,10 @@ def main():
         writer.close()
 
     total_time = time.time() - start_time
-    print(f"[INFO] Training finished in {total_time/60:.2f} minutes, global_step={global_step}")
+    print(
+        f"[INFO] Training finished in {total_time/60:.2f} minutes, "
+        f"final_global_step={global_step}, steps_this_run={global_step - initial_global_step}"
+    )
 
 
 if __name__ == "__main__":

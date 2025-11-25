@@ -33,7 +33,13 @@ from torch.distributions.categorical import Categorical
 # Import the environment and agent from the training script.
 # This assumes `eval_doom_agent.py` and `doom_ppo_deadly_corridor.py`
 # live in the same directory.
-from doom_ppo_deadly_corridor import VizDoomGymnasiumEnv, DoomConfig, PPOAgent
+from doom_ppo_deadly_corridor import (
+    VizDoomGymnasiumEnv,
+    DoomConfig,
+    PPOAgent,
+    SCENARIO_CFG_MAP,
+    SCENARIO_SHAPING_DEFAULTS,
+)
 
 
 def parse_args():
@@ -51,6 +57,12 @@ def parse_args():
         type=str,
         default="configs/basic.cfg",
         help="Path to ViZDoom .cfg scenario (e.g. configs/basic.cfg, configs/deadly_corridor.cfg)",
+    )
+    parser.add_argument(
+        "--scenario-name",
+        type=str,
+        default=None,
+        help="Scenario name shortcut; overrides --scenario-cfg when provided",
     )
 
     # Evaluation settings
@@ -98,8 +110,82 @@ def parse_args():
         default=0.0,
         help="Optional delay (in seconds) between env steps during evaluation, e.g. 0.03",
     )
+    parser.add_argument(
+        "--use-shared-actions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the unified action set across scenarios (matches training defaults)",
+    )
+
+    # Reward shaping to keep metrics consistent with training
+    parser.add_argument(
+        "--kill-reward",
+        type=float,
+        default=None,
+        help="Extra reward per enemy kill (delta KILLCOUNT)",
+    )
+    parser.add_argument(
+        "--ammo-penalty",
+        type=float,
+        default=None,
+        help="Penalty per ammo used (AMMO2 delta)",
+    )
+    parser.add_argument(
+        "--progress-scale",
+        type=float,
+        default=None,
+        help="Scale for POSITION_X progress reward (Deadly Corridor)",
+    )
+    parser.add_argument(
+        "--health-penalty",
+        type=float,
+        default=None,
+        help="Penalty per point of health lost",
+    )
+    parser.add_argument(
+        "--death-penalty",
+        type=float,
+        default=None,
+        help="Additional penalty when dying early",
+    )
 
     return parser.parse_args()
+
+
+def build_eval_config(args) -> DoomConfig:
+    """
+    Mirror the training-side scenario + shaping resolution so evaluation metrics
+    match the reward signals the policy was trained on.
+    """
+    if args.scenario_name:
+        scenario_name = args.scenario_name.lower().replace("-", "_")
+        if scenario_name in SCENARIO_CFG_MAP:
+            args.scenario_cfg = SCENARIO_CFG_MAP[scenario_name]
+        else:
+            raise ValueError(f"Unknown scenario name: {args.scenario_name}")
+    else:
+        scenario_name = os.path.splitext(os.path.basename(args.scenario_cfg))[0].lower()
+        scenario_name = scenario_name.replace("-", "_")
+
+    defaults = SCENARIO_SHAPING_DEFAULTS.get(
+        scenario_name, SCENARIO_SHAPING_DEFAULTS["basic"]
+    )
+    kill_reward = defaults["kill_reward"] if args.kill_reward is None else args.kill_reward
+    ammo_penalty = defaults["ammo_penalty"] if args.ammo_penalty is None else args.ammo_penalty
+    progress_scale = defaults["progress_scale"] if args.progress_scale is None else args.progress_scale
+    health_penalty = defaults["health_penalty"] if args.health_penalty is None else args.health_penalty
+    death_penalty = defaults["death_penalty"] if args.death_penalty is None else args.death_penalty
+
+    return DoomConfig(
+        scenario_cfg=args.scenario_cfg,
+        scenario_name=scenario_name,
+        use_shared_actions=args.use_shared_actions,
+        kill_reward=kill_reward,
+        ammo_penalty=ammo_penalty,
+        progress_scale=progress_scale,
+        health_penalty=health_penalty,
+        death_penalty=death_penalty,
+    )
 
 
 def load_agent(
@@ -175,7 +261,13 @@ def main():
     # -------------------------
     # We reuse the same DoomConfig and VizDoomGymnasiumEnv classes from training,
     # but here we only create ONE env (no vectorization).
-    cfg = DoomConfig(scenario_cfg=args.scenario_cfg)
+    cfg = build_eval_config(args)
+    print(
+        f"[INFO] Scenario '{cfg.scenario_name}' using cfg={cfg.scenario_cfg} "
+        f"(kill={cfg.kill_reward}, ammo_penalty={cfg.ammo_penalty}, "
+        f"progress_scale={cfg.progress_scale}, health_penalty={cfg.health_penalty}, "
+        f"death_penalty={cfg.death_penalty}, shared_actions={cfg.use_shared_actions})"
+    )
     render_mode = "human" if args.render else None
     env = VizDoomGymnasiumEnv(cfg, render_mode=render_mode)
 
