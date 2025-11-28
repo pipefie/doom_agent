@@ -93,7 +93,7 @@ class VizDoomGymnasiumEnv(gym.Env):
     Gymnasium-compatible wrapper around ViZDoom.
 
     - Returns observations as stacked grayscale frames: (C, H, W),
-      where C = frame_stack.
+      where C = frame_stack (4).
     - Uses Gymnasium API: step() -> (obs, reward, terminated, truncated, info).
     - Reward shaping is scenario-aware:
         * Basic / Defend the Center → kill reward + ammo penalty
@@ -189,6 +189,9 @@ class VizDoomGymnasiumEnv(gym.Env):
         """
         Convert raw ViZDoom frame to processed (H, W) grayscale:
         - Handle both CHW and HWC layouts.
+            - C: channels  (1, 3, or 4)
+            - H: height
+            - W: width
         - Resize to (frame_height, frame_width).
         - Normalize to [0, 1].
         """
@@ -459,34 +462,92 @@ class PPOAgent(nn.Module):
     """
     Actor-Critic network for PPO:
     - NatureCNN feature extractor
+    - Optional LSTM to capture temporal dependencies
     - Policy head (Categorical over discrete actions)
     - Value head
     """
 
-    def __init__(self, obs_space: gym.Space, action_space: gym.Space):
+    def __init__(
+        self,
+        obs_space: gym.Space,
+        action_space: gym.Space,
+        use_lstm: bool = False,
+        lstm_hidden_size: int = 512,
+    ):
         super().__init__()
         assert isinstance(action_space, gym.spaces.Discrete)
         self.in_channels = obs_space.shape[0]
-        self.features = NatureCNN(self.in_channels, features_dim=512)
-        self.actor = layer_init(nn.Linear(512, action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(512, 1), std=1.0)
+        self.use_lstm = use_lstm
+        self.lstm_hidden_size = lstm_hidden_size
+        self.num_layers = 1
 
-    def get_value(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.features(x)
-        return self.critic(features)
+        # Vision encoder
+        self.features = NatureCNN(self.in_channels, features_dim=512)
+        core_output_dim = 512
+
+        # Optional memory core
+        if self.use_lstm:
+            self.lstm = nn.LSTM(
+                input_size=core_output_dim,
+                hidden_size=self.lstm_hidden_size,
+                num_layers=self.num_layers,
+            )
+            core_output_dim = self.lstm_hidden_size
+
+        # Heads
+        self.actor = layer_init(nn.Linear(core_output_dim, action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(core_output_dim, 1), std=1.0)
+
+    def get_initial_state(self, batch_size: int, device: torch.device):
+        """
+        Returns zeroed initial LSTM hidden and cell states.
+        """
+        h = torch.zeros(self.num_layers, batch_size, self.lstm_hidden_size, device=device)
+        c = torch.zeros(self.num_layers, batch_size, self.lstm_hidden_size, device=device)
+        return (h, c)
 
     def get_action_and_value(
-        self, x: torch.Tensor, action: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        lstm_state: Tuple[torch.Tensor, torch.Tensor] | None = None,
+        done: torch.Tensor | None = None,
+        action: torch.Tensor | None = None,
+        deterministic: bool = False,
     ):
-        features = self.features(x)
+        """
+        Forward pass with optional LSTM support.
+
+        Args:
+            x: observations (B, C, H, W)
+            lstm_state: tuple (h, c) with shape (num_layers, B, hidden)
+            done: tensor (B,) where 1.0 resets hidden state for finished envs
+            action: optional actions to evaluate; if None, sample from policy
+        """
+        batch_size = x.shape[0]
+        features = self.features(x)  # (B, 512)
+
+        if self.use_lstm:
+            if lstm_state is None:
+                lstm_state = self.get_initial_state(batch_size, x.device)
+            if done is None:
+                done = torch.zeros(batch_size, device=x.device)
+            done = done.view(1, batch_size, 1)
+            h, c = lstm_state
+            h = h * (1.0 - done)
+            c = c * (1.0 - done)
+            lstm_out, new_state = self.lstm(features.unsqueeze(0), (h, c))
+            features = lstm_out.squeeze(0)
+        else:
+            new_state = lstm_state
+
         logits = self.actor(features)
         dist = Categorical(logits=logits)
         if action is None:
-            action = dist.sample()
+            action = dist.sample() if not deterministic else torch.argmax(logits, dim=-1)
         logprob = dist.log_prob(action)
         entropy = dist.entropy()
         value = self.critic(features)
-        return action, logprob, entropy, value
+        return action, logprob, entropy, value, new_state
 
 
 # =========================
@@ -553,6 +614,10 @@ def parse_args():
     parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
     parser.add_argument("--torch-deterministic", action="store_true",
                         help="Sets torch.backends.cudnn.deterministic=True for reproducibility")
+    parser.add_argument("--use-lstm", action="store_true",
+                        help="Enable LSTM memory after the CNN encoder")
+    parser.add_argument("--lstm-hidden-size", type=int, default=512,
+                        help="Hidden size of the LSTM when enabled")
     
 
 
@@ -613,9 +678,15 @@ def main():
     assert args.num_steps > 0
     assert args.num_envs > 0
     batch_size = args.num_envs * args.num_steps
-    assert batch_size % args.num_minibatches == 0, \
-        "batch_size must be divisible by num_minibatches"
-    minibatch_size = batch_size // args.num_minibatches
+    if args.use_lstm:
+        # For recurrent training we batch by environments, not flattened timesteps.
+        assert args.num_envs % args.num_minibatches == 0, \
+            "num_envs must be divisible by num_minibatches when using LSTM"
+        minibatch_size = args.num_envs // args.num_minibatches
+    else:
+        assert batch_size % args.num_minibatches == 0, \
+            "batch_size must be divisible by num_minibatches"
+        minibatch_size = batch_size // args.num_minibatches
 
     # Seeding
     np.random.seed(args.seed)
@@ -634,7 +705,12 @@ def main():
     act_space = envs.single_action_space
 
     # Agent
-    agent = PPOAgent(obs_space, act_space).to(device)
+    agent = PPOAgent(
+        obs_space,
+        act_space,
+        use_lstm=args.use_lstm,
+        lstm_hidden_size=args.lstm_hidden_size,
+    ).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # Optional warm start for curriculum or resuming training
@@ -651,9 +727,11 @@ def main():
               f"(global_step={global_step})")
 
     # Logging
+    lstm_tag = "lstm" if args.use_lstm else "ff"
     run_name = (
         f"{args.exp_name}_"
         f"{os.path.basename(args.scenario_cfg).replace('.cfg', '')}_"
+        f"{lstm_tag}_"
         f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_seed{args.seed}"
     )
     writer = None
@@ -673,12 +751,21 @@ def main():
     rewards = np.zeros((args.num_steps, args.num_envs), dtype=np.float32)
     dones = np.zeros((args.num_steps, args.num_envs), dtype=np.bool_)
     values = np.zeros((args.num_steps, args.num_envs), dtype=np.float32)
+    if args.use_lstm:
+        lstm_states_h = np.zeros(
+            (args.num_steps, agent.num_layers, args.num_envs, agent.lstm_hidden_size),
+            dtype=np.float32,
+        )
+        lstm_states_c = np.zeros_like(lstm_states_h)
 
     initial_global_step = global_step
     start_time = time.time()
 
     next_obs, _ = envs.reset()
     next_done = np.zeros(args.num_envs, dtype=np.bool_)
+    next_lstm_state = None
+    if args.use_lstm:
+        next_lstm_state = agent.get_initial_state(args.num_envs, device)
 
     num_updates = args.total_timesteps // batch_size
 
@@ -705,7 +792,21 @@ def main():
             # Convert obs to torch tensor
             obs_tensor = torch.tensor(next_obs, dtype=torch.float32, device=device)
             with torch.no_grad():
-                action_tensor, logprob_tensor, _, value_tensor = agent.get_action_and_value(obs_tensor)
+                if args.use_lstm:
+                    lstm_states_h[step] = next_lstm_state[0].detach().cpu().numpy()
+                    lstm_states_c[step] = next_lstm_state[1].detach().cpu().numpy()
+                    done_tensor = torch.tensor(next_done, dtype=torch.float32, device=device)
+                    (
+                        action_tensor,
+                        logprob_tensor,
+                        _,
+                        value_tensor,
+                        next_lstm_state,
+                    ) = agent.get_action_and_value(
+                        obs_tensor, next_lstm_state, done_tensor
+                    )
+                else:
+                    action_tensor, logprob_tensor, _, value_tensor, _ = agent.get_action_and_value(obs_tensor)
             action_np = action_tensor.cpu().numpy()
             value_np = value_tensor.squeeze(-1).cpu().numpy()
             logprob_np = logprob_tensor.cpu().numpy()
@@ -732,7 +833,13 @@ def main():
         # Bootstrap value for last observation
         with torch.no_grad():
             next_obs_tensor = torch.tensor(next_obs, dtype=torch.float32, device=device)
-            _, _, _, next_value = agent.get_action_and_value(next_obs_tensor)
+            if args.use_lstm:
+                next_done_tensor = torch.tensor(next_done, dtype=torch.float32, device=device)
+                _, _, _, next_value, _ = agent.get_action_and_value(
+                    next_obs_tensor, next_lstm_state, next_done_tensor
+                )
+            else:
+                _, _, _, next_value, _ = agent.get_action_and_value(next_obs_tensor)
             next_value = next_value.squeeze(-1).cpu().numpy()
 
         # Compute GAE advantages
@@ -755,84 +862,196 @@ def main():
             )
         returns = advantages + values
 
-        # Flatten the batch
-        b_obs = torch.tensor(obs.reshape((-1, *obs_shape)), device=device)
-        b_actions = torch.tensor(actions.reshape(-1), device=device)
-        b_logprobs = torch.tensor(logprobs.reshape(-1), device=device)
-        b_advantages = torch.tensor(advantages.reshape(-1), device=device)
-        b_returns = torch.tensor(returns.reshape(-1), device=device)
-        b_values = torch.tensor(values.reshape(-1), device=device)
+        if args.use_lstm:
+            # Keep time and env dimensions; normalize advantages globally if requested.
+            b_advantages = torch.tensor(advantages, device=device)
+            if args.norm_adv:
+                flat_adv = b_advantages.flatten()
+                flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
+                b_advantages = flat_adv.view_as(b_advantages)
 
-        if args.norm_adv:
-            b_advantages = (b_advantages - b_advantages.mean()) / (
-                b_advantages.std() + 1e-8
-            )
+            b_returns = torch.tensor(returns, device=device)
+            b_values = torch.tensor(values, device=device)
+            b_logprobs = torch.tensor(logprobs, device=device)
+            b_actions = torch.tensor(actions, device=device)
+            b_obs = torch.tensor(obs, device=device)
+            b_dones = torch.tensor(dones, device=device).float()
 
-        # PPO update
-        inds = np.arange(batch_size)
-        clip_fracs = []
-        for epoch in range(args.update_epochs):
-            np.random.shuffle(inds)
-            for start in range(0, batch_size, minibatch_size):
-                end = start + minibatch_size
-                mb_inds = inds[start:end]
+            env_inds = np.arange(args.num_envs)
+            clip_fracs = []
+            for epoch in range(args.update_epochs):
+                np.random.shuffle(env_inds)
+                for start in range(0, args.num_envs, minibatch_size):
+                    end = start + minibatch_size
+                    mb_env_inds = env_inds[start:end]
 
-                mb_obs = b_obs[mb_inds]
-                mb_actions = b_actions[mb_inds]
-                mb_logprobs_old = b_logprobs[mb_inds]
-                mb_advantages = b_advantages[mb_inds]
-                mb_returns = b_returns[mb_inds]
-                mb_values_old = b_values[mb_inds]
+                    mb_obs = b_obs[:, mb_env_inds]
+                    mb_actions = b_actions[:, mb_env_inds]
+                    mb_logprobs_old = b_logprobs[:, mb_env_inds]
+                    mb_advantages = b_advantages[:, mb_env_inds]
+                    mb_returns = b_returns[:, mb_env_inds]
+                    mb_values_old = b_values[:, mb_env_inds]
+                    mb_dones = b_dones[:, mb_env_inds]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    mb_obs, mb_actions
+                    # Initial LSTM states at the start of the rollout segment
+                    mb_h0 = torch.tensor(
+                        lstm_states_h[0, :, mb_env_inds], device=device
+                    )
+                    mb_c0 = torch.tensor(
+                        lstm_states_c[0, :, mb_env_inds], device=device
+                    )
+                    lstm_state = (mb_h0, mb_c0)
+
+                    newlogprobs = []
+                    entropies = []
+                    newvalues = []
+                    for t in range(args.num_steps):
+                        (
+                            _,
+                            logprob,
+                            entropy,
+                            value,
+                            lstm_state,
+                        ) = agent.get_action_and_value(
+                            mb_obs[t],
+                            lstm_state,
+                            mb_dones[t],
+                            mb_actions[t],
+                        )
+                        newlogprobs.append(logprob)
+                        entropies.append(entropy)
+                        newvalues.append(value.view(-1))
+
+                    newlogprob = torch.stack(newlogprobs, dim=0)
+                    entropy = torch.stack(entropies, dim=0)
+                    newvalue = torch.stack(newvalues, dim=0)
+
+                    logratio = newlogprob - mb_logprobs_old
+                    ratio = logratio.exp()
+
+                    with torch.no_grad():
+                        approx_kl = ((ratio - 1) - logratio).mean().item()
+                    clip_fracs.append(
+                        ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
+                    )
+
+                    mb_advantages = mb_advantages.reshape(-1)
+                    mb_returns = mb_returns.reshape(-1)
+                    mb_values_old = mb_values_old.reshape(-1)
+                    newlogprob = newlogprob.reshape(-1)
+                    newvalue = newvalue.reshape(-1)
+
+                    # Policy loss
+                    pg_loss1 = -mb_advantages * ratio.reshape(-1)
+                    pg_loss2 = -mb_advantages * torch.clamp(
+                        ratio.reshape(-1),
+                        1.0 - args.clip_coef,
+                        1.0 + args.clip_coef,
+                    )
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    # Value loss
+                    v_loss_unclipped = (newvalue - mb_returns) ** 2
+                    v_clipped = mb_values_old + torch.clamp(
+                        newvalue - mb_values_old,
+                        -args.clip_coef,
+                        args.clip_coef,
+                    )
+                    v_loss_clipped = (v_clipped - mb_returns) ** 2
+                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                    v_loss = 0.5 * v_loss_max.mean()
+
+                    # Entropy bonus
+                    entropy_loss = entropy.mean()
+
+                    loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    optimizer.step()
+
+                if args.target_kl is not None and approx_kl > args.target_kl:
+                    print(f"[INFO] Early stopping at epoch {epoch} due to KL={approx_kl:.5f}")
+                    break
+        else:
+            # Feedforward PPO update (original path)
+            b_obs = torch.tensor(obs.reshape((-1, *obs_shape)), device=device)
+            b_actions = torch.tensor(actions.reshape(-1), device=device)
+            b_logprobs = torch.tensor(logprobs.reshape(-1), device=device)
+            b_advantages = torch.tensor(advantages.reshape(-1), device=device)
+            b_returns = torch.tensor(returns.reshape(-1), device=device)
+            b_values = torch.tensor(values.reshape(-1), device=device)
+
+            if args.norm_adv:
+                b_advantages = (b_advantages - b_advantages.mean()) / (
+                    b_advantages.std() + 1e-8
                 )
-                newvalue = newvalue.view(-1)
 
-                logratio = newlogprob - mb_logprobs_old
-                ratio = logratio.exp()
+            inds = np.arange(batch_size)
+            clip_fracs = []
+            for epoch in range(args.update_epochs):
+                np.random.shuffle(inds)
+                for start in range(0, batch_size, minibatch_size):
+                    end = start + minibatch_size
+                    mb_inds = inds[start:end]
 
-                with torch.no_grad():
-                    approx_kl = ((ratio - 1) - logratio).mean().item()
-                clip_fracs.append(
-                    ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
-                )
+                    mb_obs = b_obs[mb_inds]
+                    mb_actions = b_actions[mb_inds]
+                    mb_logprobs_old = b_logprobs[mb_inds]
+                    mb_advantages = b_advantages[mb_inds]
+                    mb_returns = b_returns[mb_inds]
+                    mb_values_old = b_values[mb_inds]
 
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(
-                    ratio,
-                    1.0 - args.clip_coef,
-                    1.0 + args.clip_coef,
-                )
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
+                        mb_obs, action=mb_actions
+                    )
+                    newvalue = newvalue.view(-1)
 
-                # Value loss
-                v_loss_unclipped = (newvalue - mb_returns) ** 2
-                v_clipped = mb_values_old + torch.clamp(
-                    newvalue - mb_values_old,
-                    -args.clip_coef,
-                    args.clip_coef,
-                )
-                v_loss_clipped = (v_clipped - mb_returns) ** 2
-                v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                v_loss = 0.5 * v_loss_max.mean()
+                    logratio = newlogprob - mb_logprobs_old
+                    ratio = logratio.exp()
 
-                # Entropy bonus
-                entropy_loss = entropy.mean()
+                    with torch.no_grad():
+                        approx_kl = ((ratio - 1) - logratio).mean().item()
+                    clip_fracs.append(
+                        ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
+                    )
 
-                loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+                    # Policy loss
+                    pg_loss1 = -mb_advantages * ratio
+                    pg_loss2 = -mb_advantages * torch.clamp(
+                        ratio,
+                        1.0 - args.clip_coef,
+                        1.0 + args.clip_coef,
+                    )
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                optimizer.zero_grad()
-                loss.backward()
-                # Gradient clipping: avoids exploding gradients in deep networks,
-                # which can destabilize training.
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
+                    # Value loss
+                    v_loss_unclipped = (newvalue - mb_returns) ** 2
+                    v_clipped = mb_values_old + torch.clamp(
+                        newvalue - mb_values_old,
+                        -args.clip_coef,
+                        args.clip_coef,
+                    )
+                    v_loss_clipped = (v_clipped - mb_returns) ** 2
+                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                    v_loss = 0.5 * v_loss_max.mean()
 
-            if args.target_kl is not None and approx_kl > args.target_kl:
-                print(f"[INFO] Early stopping at epoch {epoch} due to KL={approx_kl:.5f}")
-                break
+                    # Entropy bonus
+                    entropy_loss = entropy.mean()
+
+                    loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    # Gradient clipping: avoids exploding gradients in deep networks,
+                    # which can destabilize training.
+                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    optimizer.step()
+
+                if args.target_kl is not None and approx_kl > args.target_kl:
+                    print(f"[INFO] Early stopping at epoch {epoch} due to KL={approx_kl:.5f}")
+                    break
 
         # Logging
         explained_var = np.nan

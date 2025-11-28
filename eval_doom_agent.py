@@ -28,7 +28,6 @@ from typing import Optional
 
 import numpy as np
 import torch
-from torch.distributions.categorical import Categorical
 
 # Import the environment and agent from the training script.
 # This assumes `eval_doom_agent.py` and `doom_ppo_deadly_corridor.py`
@@ -116,6 +115,17 @@ def parse_args():
         default=True,
         help="Use the unified action set across scenarios (matches training defaults)",
     )
+    parser.add_argument(
+        "--use-lstm",
+        action="store_true",
+        help="Enable LSTM memory (must match training setting)",
+    )
+    parser.add_argument(
+        "--lstm-hidden-size",
+        type=int,
+        default=512,
+        help="Hidden size of the LSTM when enabled",
+    )
 
     # Reward shaping to keep metrics consistent with training
     parser.add_argument(
@@ -193,6 +203,8 @@ def load_agent(
     obs_shape,
     action_space,
     device: torch.device,
+    use_lstm: bool = False,
+    lstm_hidden_size: int = 512,
 ) -> PPOAgent:
     """
     Create a PPOAgent with the correct input/output sizes and load its weights
@@ -208,7 +220,12 @@ def load_agent(
     fake_obs_space = type("ObsSpace", (), {"shape": obs_shape})
     fake_action_space = action_space
 
-    agent = PPOAgent(fake_obs_space, fake_action_space).to(device)
+    agent = PPOAgent(
+        fake_obs_space,
+        fake_action_space,
+        use_lstm=use_lstm,
+        lstm_hidden_size=lstm_hidden_size,
+    ).to(device)
     agent.load_state_dict(checkpoint["model_state_dict"])
     agent.eval()  # Put in evaluation mode (disables dropout, etc.)
 
@@ -220,8 +237,10 @@ def select_action(
     agent: PPOAgent,
     obs: np.ndarray,
     device: torch.device,
+    lstm_state,
+    done: bool,
     deterministic: bool = False,
-) -> int:
+) -> tuple[int, tuple]:
     """
     Given a single observation (C, H, W), returns an action (int).
 
@@ -230,18 +249,14 @@ def select_action(
     """
     # Add batch dimension and convert to torch tensor
     obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+    done_tensor = torch.tensor([float(done)], device=device)
     with torch.no_grad():
-        features = agent.features(obs_tensor)  # (1, feat_dim)
-        logits = agent.actor(features)         # (1, n_actions)
-
-        if deterministic:
-            action_tensor = torch.argmax(logits, dim=-1)
-        else:
-            dist = Categorical(logits=logits)
-            action_tensor = dist.sample()
+        action_tensor, _, _, _, new_state = agent.get_action_and_value(
+            obs_tensor, lstm_state, done_tensor, deterministic=deterministic
+        )
 
     action = int(action_tensor.cpu().numpy()[0])
-    return action
+    return action, new_state
 
 
 def main():
@@ -283,6 +298,8 @@ def main():
         obs_shape=obs_space.shape,
         action_space=action_space,
         device=device,
+        use_lstm=args.use_lstm,
+        lstm_hidden_size=args.lstm_hidden_size,
     )
 
     # -------------------------
@@ -298,11 +315,19 @@ def main():
         done = False
         ep_reward = 0.0
         step_count = 0
+        lstm_state = agent.get_initial_state(1, device) if args.use_lstm else None
 
         print(f"\n=== Episode {ep + 1}/{args.episodes} ===")
 
         while not done and step_count < args.max_steps_per_episode:
-            action = select_action(agent, obs, device, deterministic=args.deterministic)
+            action, lstm_state = select_action(
+                agent,
+                obs,
+                device,
+                lstm_state,
+                done,
+                deterministic=args.deterministic,
+            )
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
