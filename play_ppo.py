@@ -1,4 +1,4 @@
-# play.py
+# play_ppo.py
 import time
 import gymnasium as gym
 import vizdoom as vzd
