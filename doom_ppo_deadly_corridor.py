@@ -36,6 +36,9 @@ class DoomConfig:
     progress_scale: float = 0.0
     health_penalty: float = 0.0
     death_penalty: float = 0.0
+    living_penalty: float = 0.0
+    kill_grace_steps: int = 0  # steps after a kill before living_penalty resumes
+    forward_penalty: float = 0.0  # penalty per forward delta when rushing without recent kills
 
 
 # Scenario helpers so CLI users can pick stages by name and inherit sensible defaults.
@@ -53,6 +56,9 @@ SCENARIO_SHAPING_DEFAULTS = {
         "progress_scale": 0.0,
         "health_penalty": 0.0,
         "death_penalty": 0.0,
+        "living_penalty": 0.0,
+        "kill_grace_steps": 0,
+        "forward_penalty": 0.0,
     },
     "defend_the_center": {
         "kill_reward": 5.0,
@@ -60,6 +66,9 @@ SCENARIO_SHAPING_DEFAULTS = {
         "progress_scale": 0.0,
         "health_penalty": 0.0,
         "death_penalty": 0.0,
+        "living_penalty": 0.0,
+        "kill_grace_steps": 0,
+        "forward_penalty": 0.0,
     },
     "deadly_corridor": {
         # Stronger shaping to offset sparse rewards and punish early suicides.
@@ -68,6 +77,9 @@ SCENARIO_SHAPING_DEFAULTS = {
         "progress_scale": 0.05,  # Reward forward motion down the corridor.
         "health_penalty": 0.05,
         "death_penalty": 5.0,
+        "living_penalty": 0.0,
+        "kill_grace_steps": 0,
+        "forward_penalty": 0.0,
     },
 }
 
@@ -109,6 +121,7 @@ class VizDoomGymnasiumEnv(gym.Env):
         self.cfg = cfg
         self.scenario_name = (cfg.scenario_name or "basic").lower()
         self.render_mode = render_mode
+        self.steps_since_kill = 0
 
         # Initialize Doom game
         self.game = vzd.DoomGame()
@@ -282,6 +295,7 @@ class VizDoomGymnasiumEnv(gym.Env):
             delta_kill = killcount - self.prev_killcount
             if delta_kill > 0:
                 shaped += self.cfg.kill_reward * delta_kill
+                self.steps_since_kill = 0
             self.prev_killcount = killcount
         # Ammo penalty
         if self.ammo_idx is not None:
@@ -299,6 +313,22 @@ class VizDoomGymnasiumEnv(gym.Env):
             if delta_x != 0.0:
                 shaped += self.cfg.progress_scale * delta_x
             self.prev_posx = posx
+        elif self.progress_idx is not None:
+            # Even when progress reward is disabled, track delta_x for forward-penalty.
+            posx = float(vars_[self.progress_idx])
+            delta_x = posx - self.prev_posx
+            self.prev_posx = posx
+        else:
+            delta_x = 0.0
+
+        # Forward penalty when rushing without recent kills.
+        if (
+            self.cfg.forward_penalty > 0.0
+            and self.progress_idx is not None
+            and delta_x > 0.0
+            and self.steps_since_kill > self.cfg.kill_grace_steps
+        ):
+            shaped -= self.cfg.forward_penalty * delta_x
 
         # Health shaping: penalize health loss to discourage reckless damage intake.
         if self.health_idx is not None and self.cfg.health_penalty != 0.0:
@@ -318,6 +348,7 @@ class VizDoomGymnasiumEnv(gym.Env):
             super().reset(seed=seed)
 
         self.game.new_episode()
+        self.steps_since_kill = 0
 
         state = self.game.get_state()
         frame = state.screen_buffer  # (H, W, C) uint8
@@ -363,6 +394,15 @@ class VizDoomGymnasiumEnv(gym.Env):
 
         # Reward shaping: adjust reward before returning
         reward = self._shape_reward(float(base_reward), state, terminated)
+
+        # Living penalty when no recent kill: encourages regular threat clearing over rushing.
+        if (
+            self.cfg.living_penalty > 0.0
+            and self.steps_since_kill >= self.cfg.kill_grace_steps
+            and not terminated
+        ):
+            reward -= self.cfg.living_penalty
+        self.steps_since_kill += 1
 
         return obs, reward, terminated, truncated, info
 
@@ -568,6 +608,8 @@ def parse_args():
     parser.add_argument("--num-steps", type=int, default=128,
                         help="Number of environment steps per update (per env)")
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
+    parser.add_argument("--frame-skip", type=int, default=4,
+                        help="Number of game tics per action (lower = finer control, slower fps)")
 
     parser.add_argument("--render", action="store_true", help="Render first env window")
     parser.add_argument("--seed", type=int, default=42)
@@ -585,6 +627,12 @@ def parse_args():
                         help="Penalty per point of health lost")
     parser.add_argument("--death-penalty", type=float, default=None,
                         help="Additional penalty when dying early")
+    parser.add_argument("--living-penalty", type=float, default=None,
+                        help="Per-step penalty when no recent kill (encourages clearing enemies)")
+    parser.add_argument("--kill-grace-steps", type=int, default=None,
+                        help="Number of steps after a kill before living-penalty resumes")
+    parser.add_argument("--forward-penalty", type=float, default=None,
+                        help="Penalty per forward delta when no recent kill (discourages rushing past threats)")
 
     # PPO hyperparameters
     parser.add_argument("--learning-rate", type=float, default=2.5e-4)
@@ -656,16 +704,23 @@ def main():
     args.progress_scale = defaults["progress_scale"] if args.progress_scale is None else args.progress_scale
     args.health_penalty = defaults["health_penalty"] if args.health_penalty is None else args.health_penalty
     args.death_penalty = defaults["death_penalty"] if args.death_penalty is None else args.death_penalty
+    args.living_penalty = defaults["living_penalty"] if args.living_penalty is None else args.living_penalty
+    args.kill_grace_steps = defaults["kill_grace_steps"] if args.kill_grace_steps is None else args.kill_grace_steps
+    args.forward_penalty = defaults["forward_penalty"] if args.forward_penalty is None else args.forward_penalty
 
     doom_cfg = DoomConfig(
         scenario_cfg=args.scenario_cfg,
         scenario_name=scenario_name,
         use_shared_actions=args.use_shared_actions,
+        frame_skip=args.frame_skip,
         kill_reward=args.kill_reward,
         ammo_penalty=args.ammo_penalty,
         progress_scale=args.progress_scale,
         health_penalty=args.health_penalty,
         death_penalty=args.death_penalty,
+        living_penalty=args.living_penalty,
+        kill_grace_steps=args.kill_grace_steps,
+        forward_penalty=args.forward_penalty,
     )
 
     print(f"[INFO] Scenario '{scenario_name}' using cfg={args.scenario_cfg}")
@@ -752,8 +807,9 @@ def main():
     dones = np.zeros((args.num_steps, args.num_envs), dtype=np.bool_)
     values = np.zeros((args.num_steps, args.num_envs), dtype=np.float32)
     if args.use_lstm:
+        # Store LSTM states as (time, env, layer, hidden) to avoid axis confusion later.
         lstm_states_h = np.zeros(
-            (args.num_steps, agent.num_layers, args.num_envs, agent.lstm_hidden_size),
+            (args.num_steps, args.num_envs, agent.num_layers, agent.lstm_hidden_size),
             dtype=np.float32,
         )
         lstm_states_c = np.zeros_like(lstm_states_h)
@@ -793,8 +849,14 @@ def main():
             obs_tensor = torch.tensor(next_obs, dtype=torch.float32, device=device)
             with torch.no_grad():
                 if args.use_lstm:
-                    lstm_states_h[step] = next_lstm_state[0].detach().cpu().numpy()
-                    lstm_states_c[step] = next_lstm_state[1].detach().cpu().numpy()
+                    # next_lstm_state is (layers, batch, hidden); store as (batch, layers, hidden)
+                    # This makes it easy to slice by env later without mixing the layer axis.
+                    lstm_states_h[step] = np.transpose(
+                        next_lstm_state[0].detach().cpu().numpy(), (1, 0, 2)
+                    )
+                    lstm_states_c[step] = np.transpose(
+                        next_lstm_state[1].detach().cpu().numpy(), (1, 0, 2)
+                    )
                     done_tensor = torch.tensor(next_done, dtype=torch.float32, device=device)
                     (
                         action_tensor,
@@ -821,14 +883,27 @@ def main():
             rewards[step] = reward
             next_done = done
 
-            # Logging episodic returns from RecordEpisodeStatistics (Gymnasium)
-            if writer is not None and "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info is not None and "episode" in info:
-                        ep_r = info["episode"]["r"]
-                        ep_l = info["episode"]["l"]
-                        writer.add_scalar("charts/episodic_return", ep_r, global_step)
-                        writer.add_scalar("charts/episodic_length", ep_l, global_step)
+            # Logging episodic returns from RecordEpisodeStatistics (Gymnasium).
+            # Handle both SyncVectorEnv's "final_info" list of dicts and the direct
+            # "episode" dict (which can contain scalars or per-env arrays).
+            if writer is not None:
+                final_infos = infos.get("final_info")
+                candidate_infos = []
+                if final_infos is not None:
+                    candidate_infos.extend([fi["episode"] for fi in final_infos or [] if fi and "episode" in fi])
+                if "episode" in infos and infos["episode"] is not None:
+                    candidate_infos.append(infos["episode"])
+
+                for ep_info in candidate_infos:
+                    r = ep_info.get("r")
+                    l = ep_info.get("l")
+                    if r is None or l is None:
+                        continue
+                    r_arr = np.atleast_1d(r)
+                    l_arr = np.atleast_1d(l)
+                    for rr, ll in zip(r_arr, l_arr):
+                        writer.add_scalar("charts/episodic_return", float(rr), global_step)
+                        writer.add_scalar("charts/episodic_length", float(ll), global_step)
 
         # Bootstrap value for last observation
         with torch.no_grad():
@@ -893,13 +968,15 @@ def main():
                     mb_values_old = b_values[:, mb_env_inds]
                     mb_dones = b_dones[:, mb_env_inds]
 
-                    # Initial LSTM states at the start of the rollout segment
+                    # Initial LSTM states at the start of the rollout segment.
+                    # Stored as (env, layer, hidden); reshape to (layer, env, hidden)
+                    # so torch LSTM sees (num_layers, batch, hidden_size).
                     mb_h0 = torch.tensor(
-                        lstm_states_h[0, :, mb_env_inds], device=device
-                    )
+                        lstm_states_h[0, mb_env_inds], device=device
+                    ).permute(1, 0, 2)
                     mb_c0 = torch.tensor(
-                        lstm_states_c[0, :, mb_env_inds], device=device
-                    )
+                        lstm_states_c[0, mb_env_inds], device=device
+                    ).permute(1, 0, 2)
                     lstm_state = (mb_h0, mb_c0)
 
                     newlogprobs = []

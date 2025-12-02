@@ -158,6 +158,24 @@ def parse_args():
         default=None,
         help="Additional penalty when dying early",
     )
+    parser.add_argument(
+        "--living-penalty",
+        type=float,
+        default=None,
+        help="Per-step penalty when no recent kill (encourages clearing enemies)",
+    )
+    parser.add_argument(
+        "--kill-grace-steps",
+        type=int,
+        default=None,
+        help="Number of steps after a kill before living-penalty resumes",
+    )
+    parser.add_argument(
+        "--forward-penalty",
+        type=float,
+        default=None,
+        help="Penalty per forward delta when no recent kill (discourages rushing past threats)",
+    )
 
     return parser.parse_args()
 
@@ -185,6 +203,9 @@ def build_eval_config(args) -> DoomConfig:
     progress_scale = defaults["progress_scale"] if args.progress_scale is None else args.progress_scale
     health_penalty = defaults["health_penalty"] if args.health_penalty is None else args.health_penalty
     death_penalty = defaults["death_penalty"] if args.death_penalty is None else args.death_penalty
+    living_penalty = defaults.get("living_penalty", 0.0) if args.living_penalty is None else args.living_penalty
+    kill_grace_steps = defaults.get("kill_grace_steps", 0) if args.kill_grace_steps is None else args.kill_grace_steps
+    forward_penalty = defaults.get("forward_penalty", 0.0) if args.forward_penalty is None else args.forward_penalty
 
     return DoomConfig(
         scenario_cfg=args.scenario_cfg,
@@ -195,6 +216,9 @@ def build_eval_config(args) -> DoomConfig:
         progress_scale=progress_scale,
         health_penalty=health_penalty,
         death_penalty=death_penalty,
+        living_penalty=living_penalty,
+        kill_grace_steps=kill_grace_steps,
+        forward_penalty=forward_penalty,
     )
 
 

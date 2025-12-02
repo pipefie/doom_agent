@@ -29,6 +29,7 @@
 - Optional learning rate annealing to 0 over training (`--anneal-lr`).
 - Gradient clipping via `nn.utils.clip_grad_norm_` to stabilize updates.
 - Optional KL early-stop (`--target-kl`) and advantage normalization (`--norm-adv`).
+- Episodic stats in TensorBoard (`charts/episodic_return`, `charts/episodic_length`) come from `RecordEpisodeStatistics`. They appear when an env terminates/truncates; we log both `infos["final_info"]` and a direct `infos["episode"]` fallback to cover different Gymnasium versions.
 
 ## Reward Shaping
 ### Basic + Defend the Center
@@ -41,6 +42,15 @@
 - Health shaping: `--health-penalty` (default 0.05) nudges the agent away from reckless damage intake.
 - Death shaping: `--death-penalty` (default 5.0) lightly penalizes premature deaths so that the terminal reward still dominates.
 - These signals counter the “suicide quickly” behavior by valuing survival and forward progress while keeping the end-of-corridor reward the primary objective.
+- Experimental shaping adjustments (Deadly Corridor):
+  - High progress_scale (0.02) + moderate kill reward (15) led to a rushing, enemy-ignoring policy.
+  - Raising kill reward (25) and lowering progress (0.005) reduced rushing but still produced short, brittle episodes.
+  - Pushing further toward combat/survival (kill 30–50, death 25–50) while zeroing progress and easing ammo penalty increases the incentive to clear threats.
+- Increasing entropy (e.g., 0.02–0.05) and lowering frame_skip (e.g., 2) are used to break deterministic “rush one flank” habits and improve control.
+- Always match eval shaping to training; evaluating with default shaping can give misleading returns and behavior.
+- Added living_penalty + kill_grace_steps: a small per-step penalty when no kill has occurred recently, reset on each kill, to discourage “run forward without clearing threats.” Use carefully; if too high it can reintroduce rushing.
+- Added forward_penalty gated on kill_grace_steps: if `steps_since_kill > kill_grace_steps` and POSITION_X increases, subtract `forward_penalty * delta_x` to discourage advancing while ignoring enemies.
+  - Despite these tweaks, multiple runs on skill 5 still converge to deterministic rushing (short episodes, minimal kills). Next mitigations: lower `doom_skill` temporarily to teach clearing both sides, run with high entropy (e.g., 0.1–0.15) and frame_skip=1, then fine-tune back at full difficulty with the same survival-heavy shaping. Consider simplifying the action set or using a short high-entropy schedule for Deadly to avoid early collapse.
 
 ## Curriculum Learning Strategy
 - Choose scenarios by name (`--scenario-name basic|defend_the_center|deadly_corridor`) or by config path (`--scenario-cfg ...`).
@@ -71,12 +81,47 @@
 - Solution: the training/eval scripts now default to a unified 7-action list (forward/backward, turn left/right, strafe left/right, attack) via `--use-shared-actions` (on by default). This keeps the policy head shape fixed across all scenarios, so you can warm-start through the curriculum and evaluate any checkpoint anywhere.
 - You can disable with `--no-use-shared-actions`, but then checkpoints will only load in matching scenarios.
 
+## Recurrent PPO Notes (LSTM)
+- LSTM is optional (`--use-lstm`) and sits after the CNN encoder. Hidden size is configurable (`--lstm-hidden-size`, default 512).
+- Hidden states are masked with the `done` flags each step so episodes reset memory cleanly per env.
+- Rollout storage keeps LSTM states as (time, env, layer, hidden) and reorders to (layer, env, hidden) right before feeding the PyTorch LSTM. This avoids the hidden-shape mismatch bug (expected [1, batch, hidden], got [2, batch, hidden]) seen in earlier runs.
+- When LSTM is on, minibatching is by environments (`num_envs` must be divisible by `num_minibatches`); this preserves temporal order within each env during the recurrent update.
+
 ## Curriculum Progress & Early Results
 - Basic (500k steps, pre-shared-actions): produced a stable policy suitable for warm-starting Defend. (Action head size: 3.)
 - Defend the Center (warm-started from Basic, 500k steps; head size 3):
   - Deterministic eval (5 eps): shaped reward ≈ 52–71 over ~164–226 steps → ~10–14 kills/episode given +5 kill reward and light ammo penalty. Indicates stable defense behavior with modest variance.
   - Value head improved from negative explained variance early to ~0.6–0.7, and entropy dropped to ~0.25–0.30, showing convergence toward a focused policy.
 - Next: to continue into Deadly Corridor without shape mismatches, retrain Basic and Defend with the shared action set (default now on), then train Deadly Corridor from the Defend checkpoint. This aligns all checkpoints to the 7-action head.
+- Basic (500k steps, shared-actions + LSTM, run `doom_ppo_deadly_corridor_basic_lstm_2025-12-01_09-29-19_seed42`):
+  - Entropy fell from ~1.9 → ~0.12, so the policy became highly deterministic by the end of training.
+  - Value loss started extremely high (~1800) and decayed below ~50 near the end; explained variance was hugely negative early and hovered around ~0 to mildly negative later, so the critic is still imperfect but much improved versus the start.
+  - Policy loss moved from large positive to small negative/near-zero, and KL stayed tiny throughout, indicating stable but conservative PPO updates.
+  - Episodic returns should be read from TensorBoard (`charts/episodic_return`) for the final verdict on performance; the logs above show optimization stabilizing but the value fit is not yet strong. Consider a short extra run or modest vf_coef/entropy tweaks if returns plateau too low.
+- Basic (500k steps, shared-actions + LSTM, vf_coef=0.4, run `doom_ppo_deadly_corridor_basic_lstm_2025-12-01_11-04-00_seed42`):
+  - Entropy decreased from ~1.9 to ~0.45 and then hovered there, indicating the policy retained some stochasticity instead of collapsing fully deterministic.
+  - Value loss dropped from ~1900 to ~200 but explained variance remained negative, so the critic still underfits; however policy updates stayed stable (KL ~0, policy loss small/negative).
+  - Smoothed episodic return reached ~16.6 by the end (from TensorBoard), which is a reasonable improvement on Basic; if you want more, you can extend training or gently adjust entropy/vf weights, but this checkpoint is usable for warm-starting Defend with the LSTM + shared action head.
+- Defend the Center (500k steps, shared-actions + LSTM warm start from the above Basic, vf_coef=0.4, run `doom_ppo_deadly_corridor_defend_the_center_lstm_2025-12-01_12-10-19_seed42`):
+  - Entropy fell from ~1.7 to ~0.17, so the policy converged to a mostly deterministic defender.
+  - Value loss dropped to low single digits and explained variance climbed to ~0.9+, indicating a well-fit critic on this task.
+  - Policy losses stayed small/negative and KL remained tiny, suggesting stable PPO updates. This checkpoint is ready to warm-start Deadly Corridor with the LSTM + shared action head.
+- Deadly Corridor (800k steps, shared-actions + LSTM warm start from Defend, vf_coef=0.4, run `doom_ppo_deadly_corridor_deadly_corridor_lstm_2025-12-01_13-30-55_seed42`):
+  - Entropy collapsed to ~0.1–0.2, so the policy is very deterministic and visually rushes the corridor, often ignoring enemies.
+  - Value loss remained high (hundreds–thousands) with negative explained variance, indicating a poorly fit critic and noisy returns; episodic returns fluctuated heavily.
+  - Current shaping (kill=15, progress=0.02, health_penalty=0.05, death_penalty=5) likely over-rewards forward progress. Next run should rebalance toward combat: raise kill reward (e.g., 20–25), lower progress_scale (e.g., 0.005–0.01), and increase death penalty (e.g., 15–20) while keeping health penalty on. Continue from this checkpoint to test the new shaping quickly.
+  - Visual inspection: policy often turns right/rushes, gets killed frequently. This aligns with the critic underfit and the progress-heavy shaping; prioritize kill/death shaping over progress to shift behavior toward clearing enemies.
+- Deadly Corridor (800k steps, shared-actions + LSTM warm start, vf_coef=0.4, stronger kill/death shaping run `doom_ppo_deadly_corridor_deadly_corridor_lstm_2025-12-01_15-11-20_seed42` with kill=25, progress=0.005, ammo_penalty=0.01, health_penalty=0.05, death_penalty=15):
+  - Entropy stayed low (~0.1–0.25), so policy remained highly deterministic; episodic_return smoothed around ~9.7—still weak.
+  - Value loss was very large early but later EV hovered ~0.7–0.85; critic improved but returns remained modest, suggesting the policy is still brittle (e.g., simple turning/rushing, frequent deaths).
+  - Next steps: further tilt toward combat/survival (e.g., even lower progress_scale, higher death_penalty, maintain kill reward), or consider modest entropy increase to escape the deterministic rush policy.
+  - Visual inspection: agent kills one nearby enemy then rushes, ignoring the right side; episodes end quickly without reaching the goal.
+- Deadly Corridor eval note (run `doom_ppo_deadly_corridor_deadly_corridor_lstm_2025-12-01_15-11-20_seed42_step1799168.pt`):
+  - Evaluating with default shaping (kill=10, progress=0.05, death=5, ammo=0.02) produced very short episodes (~50 steps) and high shaped returns (~800) but behavior was still brittle (clears first pair, dies on second). This mismatch shows eval must mirror training shaping.
+  - Re-evaluate with the training shaping flags (kill=25, progress=0.005, ammo=0.01, health_penalty=0.05, death_penalty=15) to get meaningful metrics. If behavior remains stuck, continue training with the more survival-focused shaping (kill/death higher, progress lower/zero, slight entropy bump) described above.
+- Deadly Corridor (in progress): retraining from the Defend LSTM checkpoint with a stronger combat/survival tilt to break the rush-only policy:
+  - Shaping: `--kill-reward 30`, `--death-penalty 25`, `--progress-scale 0.001`, `--health-penalty 0.05`, `--ammo-penalty 0.005`; entropy bumped to `--ent-coef 0.02`.
+  - Rationale: de-emphasize forward progress, heavily reward kills and penalize deaths, keep health pressure, and add a bit more exploration to escape the deterministic left-side-only rush.
 
 ## Full Script Walkthrough: `doom_ppo_deadly_corridor.py`
 
