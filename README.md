@@ -50,7 +50,29 @@
 - Always match eval shaping to training; evaluating with default shaping can give misleading returns and behavior.
 - Added living_penalty + kill_grace_steps: a small per-step penalty when no kill has occurred recently, reset on each kill, to discourage “run forward without clearing threats.” Use carefully; if too high it can reintroduce rushing.
 - Added forward_penalty gated on kill_grace_steps: if `steps_since_kill > kill_grace_steps` and POSITION_X increases, subtract `forward_penalty * delta_x` to discourage advancing while ignoring enemies.
-  - Despite these tweaks, multiple runs on skill 5 still converge to deterministic rushing (short episodes, minimal kills). Next mitigations: lower `doom_skill` temporarily to teach clearing both sides, run with high entropy (e.g., 0.1–0.15) and frame_skip=1, then fine-tune back at full difficulty with the same survival-heavy shaping. Consider simplifying the action set or using a short high-entropy schedule for Deadly to avoid early collapse.
+- Despite these tweaks, multiple runs on skill 5 still converge to deterministic rushing (short episodes, minimal kills). Next mitigations: lower `doom_skill` temporarily to teach clearing both sides, run with high entropy (e.g., 0.1–0.15) and frame_skip=1, then fine-tune back at full difficulty with the same survival-heavy shaping. Consider simplifying the action set or using a short high-entropy schedule for Deadly to avoid early collapse.
+- Additional shaping/struggles log:
+  - Added `damage_reward` (reward per DAMAGECOUNT) and optional `health_delta_scale` (symmetric reward/penalty for health changes) to encourage hits/health preservation; still seeing rush/die at skill 5.
+  - Living/forward penalties kept tiny (or 0) to avoid incentivizing suicide; forward_penalty uses POSITION_X delta gated on `steps_since_kill`.
+  - Action sets per scenario when `--use-combo-actions` is on: Basic uses a small set (idle, forward, turn L/R, attack, forward+attack, turn+attack) to reduce motion noise; Defend uses a mid-size set (adds strafe+attack); Deadly uses the full 13-action set (adds strafe, backward + attack). Head size stays consistent within a run; loading older 7-action checkpoints drops the actor head and skips optimizer state to avoid shape errors.
+  - Entropy warm-up flags (`--ent-coef-warm`, `--ent-warm-steps`, `--ent-coef-final`) added; high entropy early can prevent deterministic collapse but has not fully fixed the rush/die failure at skill 5.
+  - Basic training with the small combo set and low entropy: agent still tends to wander/shoot randomly; higher kill reward (e.g., 10) and lower entropy (e.g., 0.002) are being tried to force purposeful shooting; convergence remains slow.
+
+### Deadly Corridor: Detailed Walkthrough of Current Approach
+- Problem observed: At skill 5 the agent repeatedly converges to “rush forward and die” with very short episodes. Even with high kill/death rewards and zero progress reward, entropy collapses early and PPO updates become tiny, so the policy stays deterministic. One-side bias (looks left/right only) persists, and the agent often ignores enemies after the first pair.
+- Action set change: For Deadly Corridor only, we replaced one-hot actions with a curated combo set (idle; forward/turn/strafe; attack; forward+attack; strafe+attack; turn+attack; backward+attack). This removes pure “run forward” actions and forces turning/shooting combinations.
+- Reward shaping now available:
+  - Kill/death: high (e.g., kill 80, death 100).
+  - Progress: set to 0 to eliminate forward lure.
+  - Health penalties: `health_penalty` for loss; optional symmetric `health_delta_scale` to reward medkit gains/penalize loss.
+  - Damage reward: per point of DAMAGECOUNT to reward hits even before kills.
+  - Living penalty + kill_grace_steps: small per-step cost when no kill has happened recently (use tiny values or 0 to avoid incentivizing suicide by rushing).
+  - Forward penalty: gated on `steps_since_kill > kill_grace_steps`, subtracts `forward_penalty * delta_x` to discourage advancing without clearing threats.
+- Entropy schedule: Added warm start (`--ent-coef-warm`, `--ent-warm-steps`, `--ent-coef-final`) so Deadly can run with high entropy early (e.g., 0.2 for 200k steps) and decay to target (e.g., 0.05) to avoid early deterministic collapse.
+- Frame skip: use `frame_skip=1` for finer control/aiming in Deadly; frame_skip >1 made rushing more attractive.
+- Checkpoint loading: When action-space changes (7 → 13 actions), checkpoints are loaded with `strict=False` to reuse shared layers and reinit the new head. Eval does the same.
+- What hasn’t solved it yet at skill 5: even with the above, runs often stay short; more kills on the first pair but still stuck. If keeping skill 5, combine the combo action set + high-entropy warm phase + survival-heavy shaping and keep living/forward penalties very small.
+- If all else fails: temporarily lower `doom_skill` in `deadly_corridor.cfg` to teach clearing both sides, then fine-tune back at skill 5 with the same flags; or further simplify the action set and run a shorter high-entropy schedule.
 
 ## Curriculum Learning Strategy
 - Choose scenarios by name (`--scenario-name basic|defend_the_center|deadly_corridor`) or by config path (`--scenario-cfg ...`).
@@ -235,3 +257,103 @@ Teardown
 
 Execution entry
 - `if __name__ == "__main__": main()` so running `python doom_ppo_deadly_corridor.py ...` starts training with the above pipeline.
+
+## Recent Experiments, Troubles, and Lessons (Ongoing Log)
+- **Action-set curriculum:** We now use scenario-specific combo actions when `--use-combo-actions` is enabled: Basic = small set (idle, forward, turn L/R, attack, forward+attack, turn+attack) to reduce motion noise; Defend = medium (adds strafe±attack); Deadly = full 13 combos (adds strafe, backward+attack, run-and-gun variants). Loading a checkpoint into a wider head will drop the old actor head and reinit a new one; optimizer state is skipped in that case.
+- **Entropy scheduling:** Added `--ent-coef-warm`, `--ent-warm-steps`, `--ent-coef-final` to keep exploration high early (especially in Deadly) and decay later. Without this, policies collapse to deterministic rush/turn behaviors. Very low entropy (e.g., 0.0005) is being tested on Basic to force aim/shoot instead of spinning.
+- **Shaping knobs in play:** Besides kill/death/health/progress, we added `damage_reward` (per DAMAGECOUNT), `living_penalty` with `kill_grace_steps` (tiny or zero to avoid incentivizing suicide), `forward_penalty` gated on no recent kills (to discourage advancing while ignoring enemies), and optional `health_delta_scale` for symmetric health changes. Forward shaping is often set to 0 in Deadly to avoid rush policies.
+- **Observed failures:** At skill 5, Deadly often converges to “rush forward and die,” sometimes biased to one side, even with high kill/death rewards and zero progress reward. High entropy warm phases and frame_skip=1 help but have not fully broken the pattern. Evaluations must match the training shaping; default eval shaping can mask issues with inflated returns.
+- **Basic with combo actions:** Multiple runs (500k steps) still show wandering/spinning and negative episodic returns when entropy is moderate. Current mitigation is to slam entropy down (≤0.001) and raise kill/damage incentives (kill ≥10–20, damage_reward ~1.0) so the policy latches onto “face target + shoot.” If this fails, we will prune the Basic action set further (e.g., idle, turn L/R, attack, forward+attack only) to remove aimless motion.
+- **Action mapping fix:** The combo action matrices are now explicitly aligned with the shared button order (MOVE_FWD, MOVE_BACK, TURN_L, TURN_R, MOVE_L, MOVE_R, ATTACK). Misalignment previously caused the “attack” intent to trigger turns, leading to spinning. The Basic/Defend/Deadly sets were rebuilt accordingly.
+
+## Action Encoding & Combo Sets
+- **Why multi-hot combos?** ViZDoom exposes independent buttons (move/turn/strafe/attack). Using a one-hot over single buttons prevents “run-and-gun” behaviors and makes the policy head shape scenario-dependent. We switched to multi-hot combo rows so one discrete index can trigger several buttons at once (e.g., forward+attack), enabling strafe-shooting and turn-and-shoot behaviors that are critical in Deadly Corridor.
+- **What the vector means:** Each row in the combo matrix is a multi-hot vector over the shared buttons in fixed order `[MOVE_FORWARD, MOVE_BACKWARD, TURN_LEFT, TURN_RIGHT, MOVE_LEFT, MOVE_RIGHT, ATTACK]`. A 1 in a position means “press that Doom button this step.” For example, `[1,0,0,0,0,0,1]` means “move forward + attack.” ViZDoom’s `make_action` consumes this boolean list directly, so the encoding is exactly the set of buttons to press simultaneously.
+- **Shared button order:** We force a consistent button list via `SHARED_ACTION_BUTTONS` in `doom_ppo_deadly_corridor.py`: `[MOVE_FORWARD, MOVE_BACKWARD, TURN_LEFT, TURN_RIGHT, MOVE_LEFT, MOVE_RIGHT, ATTACK]`. This order is applied to the game (`set_available_buttons`) so the policy head and the Doom engine agree on indices.
+- **Scenario-specific combo sets (`--use-combo-actions`):**
+  - Basic: small, aim-focused set (idle; forward; turn L/R; attack; forward+attack; turn±attack) to reduce wander and teach “face + shoot.”
+  - Defend the Center: medium set adds strafe±attack to handle circle-strafing enemies.
+  - Deadly Corridor: full 13-action run-and-gun set (forward/back/strafe/turn combinations with attack) to cover all movement/shooting needs.
+  If combo actions are off, we fall back to an identity matrix over the available buttons.
+- **Checkpoint compatibility:** Keeping the shared button order means the actor head size is predictable. Changing the combo set size will reinit the actor head when loading a checkpoint into a different action count, but the base CNN/LSTM weights are reused. Keeping the same set across a curriculum stage avoids head resets.
+- **Config relationship:** The ViZDoom scenario `.cfg` files list available buttons, but we override them with `SHARED_ACTION_BUTTONS` to ensure consistency. Frame skip comes from the CLI (train) or the config (eval, currently fixed), so keep train/eval skip aligned to avoid control mismatch.
+- **Defend warm starts:** Defend-from-Basic LSTM checkpoints with vf_coef≈0.3–0.4 and modest entropy have behaved reasonably (scores ~50–70 shaped reward per episode), so we keep using Defend as the warm start for Deadly.
+- **Deadly corridor attempts:** With stronger combat shaping (kill up to 80, death up to 100, progress=0, health_penalty>0, ammo_penalty low) and the 13-action set, the agent still tends to short episodes, rushing or looking only one side. Value losses stay high and EV negative or near zero, indicating critic underfit and unstable returns. If skill 5 remains mandatory, consider (a) even higher early entropy warm (0.15–0.2 for ~200k steps), (b) zero/near-zero living/forward penalties, (c) more damage_reward and health_delta to bias toward engaging threats, and (d) a simplified action set for a short “aiming bootcamp” before re-expanding.
+- **Checkpoint compatibility:** When action-space size changes (e.g., 7→13), training now drops incompatible actor params and reinitializes the head; optimizer state is reset. Evaluation does the same with `strict=False` so checkpoints remain usable, but warm-start benefits for the actor logits are lost when the head size changes.
+- **Next planned tests:** Run Basic with a minimal action set and very low entropy + strong kill/damage reward to get a clean “face and shoot” prior; then Defend with the medium set; then Deadly with the full set, high-entropy warm phase, progress=0, high kill/death, modest damage_reward, and tiny/zero living/forward penalties. Keep doom_skill at 5 per current constraint; if plateau persists, temporarily lowering skill to teach clearing both sides is an option for later consideration.
+
+## Debugging Log: The 'Stuck Shooter' Problem on Basic Scenario
+
+This log details the step-by-step process of diagnosing and fixing a common reinforcement learning problem where the agent adopted a suboptimal, repetitive behavior instead of learning the intended task.
+
+### 1. The Initial Problem: Suboptimal Local Minimum
+
+- **Observation:** When training on the `basic` scenario, the agent learned to move to the side of the arena and shoot continuously at a wall. It was not actively pursuing or killing the enemy.
+- **Interpretation:** The agent found a "local minimum" in its policy. This behavior, while not optimal, was "safe" and produced a consistent (though not good) outcome according to its flawed understanding of the environment. It learned that shooting was an action, but not how to connect that action to a successful outcome.
+
+### 2. Diagnosis Part 1: Sparse Rewards
+
+- **Investigation:** The initial training logs for the `basic` scenario showed the following reward shaping: `(kill=20.0, ammo_penalty=0.0075, ...)` and crucially, no `damage_reward`.
+- **Diagnosis:** This is a **sparse reward** problem. The agent only received a large positive reward upon successfully *killing* an enemy. Kills are infrequent for an untrained agent, so there can be hundreds of actions between rewards. This makes the **credit assignment problem** nearly impossible to solve; the agent cannot determine which of its many past actions were responsible for the eventual reward.
+- **Theoretical Explanation:** The goal of a reinforcement learning agent is to maximize the expected future discounted reward, $G_t = \sum_{k=0}^{\infty} \gamma^k R_{t+k+1}$. If the reward $R$ is almost always zero, the agent gets no gradient signal to update its policy. By providing smaller, more frequent (i.e., "dense") rewards for intermediate steps that lead to the goal, we provide a much clearer learning signal.
+- **Solution:** We introduced a **dense reward** by adding `damage_reward=1.0` to the default shaping for the `basic` scenario. This provides an immediate positive reward for the action of successfully hitting an enemy, directly solving the credit assignment problem for aiming.
+
+### 3. Anomaly & Diagnosis Part 2: The Evaluation Mismatch
+
+- **Observation:** After training with the new `damage_reward`, an evaluation run showed catastrophically bad performance (e.g., rewards of -300). This was contrary to the slight improvement seen during training.
+- **Investigation:** We compared the log output from the training script and the evaluation script.
+  - Training log: `... damage_reward=1.0 ...`
+  - Evaluation log: `... damage_reward` was missing.
+- **Diagnosis:** A bug was found where the evaluation script (`eval_doom_agent.py`) was not correctly loading or logging the `damage_reward` from the scenario defaults. The agent was being trained in one environment (with damage rewards) and evaluated in another (without them). Its policy was nonsensical in the evaluation environment, leading to the terrible scores.
+- **Solution:** The `eval_doom_agent.py` script was patched to correctly apply and log all reward shaping parameters, ensuring the training and evaluation environments were identical.
+
+### 4. Diagnosis Part 3: Unstable Value Function (Critic Failure)
+
+- **Observation:** After fixing the evaluation script, a new evaluation showed a "brittle" or unstable policy. In some episodes, the agent performed well and killed the enemy quickly. In others, it reverted to the old behavior of getting stuck. The skill was learned, but not applied reliably.
+- **Investigation:** We analyzed the training logs again, focusing on the `ExplainedVar` (Explained Variance) metric. Throughout the entire training run, `ExplainedVar` remained highly negative (e.g., -0.857 at the end).
+- **Diagnosis:** The core problem was an unstable **value function** (the "Critic" in our Actor-Critic model).
+- **Theoretical Explanation:** Explained Variance measures how well the Critic's predictions of future rewards match the actual rewards the agent received. A value of 1.0 is a perfect prediction; a negative value means the Critic's predictions are worse than simply guessing the average outcome. The PPO algorithm updates the policy (the "Actor") based on an "advantage" calculation, which is heavily dependent on the Critic's predictions (`Advantage ≈ Actual Reward - Predicted Reward`). If the Critic's predictions are garbage, the advantage calculation is also garbage, and the Actor receives a noisy, unreliable gradient. The agent literally cannot tell if its actions are leading to good or bad states.
+- **The PPO Loss Function:** The total loss is a combination of policy loss, value loss, and an entropy bonus: `Loss = Loss_policy + vf_coef * Loss_value - ent_coef * Loss_entropy`. In our case, `Loss_value` was massive and incorrect. Because it's part of the total loss, its huge, noisy gradients were likely overwhelming the smaller, more useful gradients from the policy and entropy losses, destabilizing the entire learning process.
+
+### 5. Current Solution: Stabilizing the Critic
+
+- **Solution:** To combat the unstable Critic, we are continuing training from the last checkpoint but with a significantly reduced **value function coefficient** (`--vf-coef 0.2`).
+- **Rationale:** By lowering `vf-coef`, we are reducing the weight of the `Loss_value` in the total loss function. This effectively tells the optimizer: "For now, don't trust the Critic's updates so much. Pay more attention to the Actor's updates, which are guided by the dense `damage_reward` we added." This should stabilize the shared layers of the neural network, allowing the policy to improve consistently while giving the critic more time to gradually learn a better value estimate from a more stable policy. The next training run's logs will be monitored for an increasing `ExplainedVar`, which will signal that this approach is working.
+
+## Debugging Log: The 'Stuck Shooter' Problem on Basic Scenario
+
+This log details the step-by-step process of diagnosing and fixing a common reinforcement learning problem where the agent adopted a suboptimal, repetitive behavior instead of learning the intended task.
+
+### 1. The Initial Problem: Suboptimal Local Minimum
+
+- **Observation:** When training on the `basic` scenario, the agent learned to move to the side of the arena and shoot continuously at a wall. It was not actively pursuing or killing the enemy.
+- **Interpretation:** The agent found a "local minimum" in its policy. This behavior, while not optimal, was "safe" and produced a consistent (though not good) outcome according to its flawed understanding of the environment. It learned that shooting was an action, but not how to connect that action to a successful outcome.
+
+### 2. Diagnosis Part 1: Sparse Rewards
+
+- **Investigation:** The initial training logs for the `basic` scenario showed the following reward shaping: `(kill=20.0, ammo_penalty=0.0075, ...)` and crucially, no `damage_reward`.
+- **Diagnosis:** This is a **sparse reward** problem. The agent only received a large positive reward upon successfully *killing* an enemy. Kills are infrequent for an untrained agent, so there can be hundreds of actions between rewards. This makes the **credit assignment problem** nearly impossible to solve; the agent cannot determine which of its many past actions were responsible for the eventual reward.
+- **Theoretical Explanation:** The goal of a reinforcement learning agent is to maximize the expected future discounted reward, $G_t = \sum_{k=0}^{\infty} \gamma^k R_{t+k+1}$. If the reward $R$ is almost always zero, the agent gets no gradient signal to update its policy. By providing smaller, more frequent (i.e., "dense") rewards for intermediate steps that lead to the goal, we provide a much clearer learning signal.
+- **Solution:** We introduced a **dense reward** by adding `damage_reward=1.0` to the default shaping for the `basic` scenario. This provides an immediate positive reward for the action of successfully hitting an enemy, directly solving the credit assignment problem for aiming.
+
+### 3. Anomaly & Diagnosis Part 2: The Evaluation Mismatch
+
+- **Observation:** After training with the new `damage_reward`, an evaluation run showed catastrophically bad performance (e.g., rewards of -300). This was contrary to the slight improvement seen during training.
+- **Investigation:** We compared the log output from the training script and the evaluation script.
+  - Training log: `... damage_reward=1.0 ...`
+  - Evaluation log: `... damage_reward` was missing.
+- **Diagnosis:** A bug was found where the evaluation script (`eval_doom_agent.py`) was not correctly loading or logging the `damage_reward` from the scenario defaults. The agent was being trained in one environment (with damage rewards) and evaluated in another (without them). Its policy was nonsensical in the evaluation environment, leading to the terrible scores.
+- **Solution:** The `eval_doom_agent.py` script was patched to correctly apply and log all reward shaping parameters, ensuring the training and evaluation environments were identical.
+
+### 4. Diagnosis Part 3: Unstable Value Function (Critic Failure)
+
+- **Observation:** After fixing the evaluation script, a new evaluation showed a "brittle" or unstable policy. In some episodes, the agent performed well and killed the enemy quickly. In others, it reverted to the old behavior of getting stuck. The skill was learned, but not applied reliably.
+- **Investigation:** We analyzed the training logs again, focusing on the `ExplainedVar` (Explained Variance) metric. Throughout the entire training run, `ExplainedVar` remained highly negative (e.g., -0.857 at the end).
+- **Diagnosis:** The core problem was an unstable **value function** (the "Critic" in our Actor-Critic model).
+- **Theoretical Explanation:** Explained Variance measures how well the Critic's predictions of future rewards match the actual rewards the agent received. A value of 1.0 is a perfect prediction; a negative value means the Critic's predictions are worse than simply guessing the average outcome. The PPO algorithm updates the policy (the "Actor") based on an "advantage" calculation, which is heavily dependent on the Critic's predictions (`Advantage ≈ Actual Reward - Predicted Reward`). If the Critic's predictions are garbage, the advantage calculation is also garbage, and the Actor receives a noisy, unreliable gradient. The agent literally cannot tell if its actions are leading to good or bad states.
+- **The PPO Loss Function:** The total loss is a combination of policy loss, value loss, and an entropy bonus: `Loss = Loss_policy + vf_coef * Loss_value - ent_coef * Loss_entropy`. In our case, `Loss_value` was massive and incorrect. Because it's part of the total loss, its huge, noisy gradients were likely overwhelming the smaller, more useful gradients from the policy and entropy losses, destabilizing the entire learning process.
+
+### 5. Current Solution: Stabilizing the Critic
+
+- **Solution:** To combat the unstable Critic, we are continuing training from the last checkpoint but with a significantly reduced **value function coefficient** (`--vf-coef 0.2`).
+- **Rationale:** By lowering `vf-coef`, we are reducing the weight of the `Loss_value` in the total loss function. This effectively tells the optimizer: "For now, don't trust the Critic's updates so much. Pay more attention to the Actor's updates, which are guided by the dense `damage_reward` we added." This should stabilize the shared layers of the neural network, allowing the policy to improve consistently while giving the critic more time to gradually learn a better value estimate from a more stable policy. The next training run's logs will be monitored for an increasing `ExplainedVar`, which will signal that this approach is working.

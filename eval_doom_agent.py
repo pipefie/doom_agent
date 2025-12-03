@@ -121,6 +121,12 @@ def parse_args():
         help="Enable LSTM memory (must match training setting)",
     )
     parser.add_argument(
+        "--use-combo-actions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use curated combo actions (applies to all scenarios if set; must match training)",
+    )
+    parser.add_argument(
         "--lstm-hidden-size",
         type=int,
         default=512,
@@ -176,6 +182,12 @@ def parse_args():
         default=None,
         help="Penalty per forward delta when no recent kill (discourages rushing past threats)",
     )
+    parser.add_argument(
+        "--damage-reward",
+        type=float,
+        default=None,
+        help="Reward per point of DAMAGECOUNT (damage inflicted)",
+    )
 
     return parser.parse_args()
 
@@ -206,10 +218,12 @@ def build_eval_config(args) -> DoomConfig:
     living_penalty = defaults.get("living_penalty", 0.0) if args.living_penalty is None else args.living_penalty
     kill_grace_steps = defaults.get("kill_grace_steps", 0) if args.kill_grace_steps is None else args.kill_grace_steps
     forward_penalty = defaults.get("forward_penalty", 0.0) if args.forward_penalty is None else args.forward_penalty
+    damage_reward = defaults["damage_reward"] if args.damage_reward is None else args.damage_reward
 
     return DoomConfig(
         scenario_cfg=args.scenario_cfg,
         scenario_name=scenario_name,
+        use_combo_actions=args.use_combo_actions,
         use_shared_actions=args.use_shared_actions,
         kill_reward=kill_reward,
         ammo_penalty=ammo_penalty,
@@ -219,6 +233,7 @@ def build_eval_config(args) -> DoomConfig:
         living_penalty=living_penalty,
         kill_grace_steps=kill_grace_steps,
         forward_penalty=forward_penalty,
+        damage_reward=damage_reward,
     )
 
 
@@ -250,7 +265,13 @@ def load_agent(
         use_lstm=use_lstm,
         lstm_hidden_size=lstm_hidden_size,
     ).to(device)
-    agent.load_state_dict(checkpoint["model_state_dict"])
+    ckpt_state = checkpoint["model_state_dict"]
+    for key in ["actor.weight", "actor.bias"]:
+        if key in ckpt_state:
+            if key in agent.state_dict() and ckpt_state[key].shape != agent.state_dict()[key].shape:
+                print(f"[WARN] Dropping incompatible {key} from checkpoint (ckpt {ckpt_state[key].shape} vs model {agent.state_dict()[key].shape})")
+                ckpt_state.pop(key)
+    agent.load_state_dict(ckpt_state, strict=False)
     agent.eval()  # Put in evaluation mode (disables dropout, etc.)
 
     print("[INFO] Agent weights loaded successfully.")
@@ -305,7 +326,8 @@ def main():
         f"[INFO] Scenario '{cfg.scenario_name}' using cfg={cfg.scenario_cfg} "
         f"(kill={cfg.kill_reward}, ammo_penalty={cfg.ammo_penalty}, "
         f"progress_scale={cfg.progress_scale}, health_penalty={cfg.health_penalty}, "
-        f"death_penalty={cfg.death_penalty}, shared_actions={cfg.use_shared_actions})"
+        f"death_penalty={cfg.death_penalty}, damage_reward={cfg.damage_reward}, "
+        f"shared_actions={cfg.use_shared_actions})"
     )
     render_mode = "human" if args.render else None
     env = VizDoomGymnasiumEnv(cfg, render_mode=render_mode)

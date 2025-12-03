@@ -24,6 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 class DoomConfig:
     scenario_cfg: str
     scenario_name: str = "basic"
+    use_combo_actions: bool = False  # force curated combo actions (helps keep head size consistent)
     frame_skip: int = 4
     frame_width: int = 84
     frame_height: int = 84
@@ -35,10 +36,12 @@ class DoomConfig:
     ammo_penalty: float = 0.01
     progress_scale: float = 0.0
     health_penalty: float = 0.0
+    health_delta_scale: float = 0.0  # symmetric reward/penalty for health changes
     death_penalty: float = 0.0
     living_penalty: float = 0.0
     kill_grace_steps: int = 0  # steps after a kill before living_penalty resumes
     forward_penalty: float = 0.0  # penalty per forward delta when rushing without recent kills
+    damage_reward: float = 0.0  # reward per point of damage inflicted
 
 
 # Scenario helpers so CLI users can pick stages by name and inherit sensible defaults.
@@ -51,24 +54,28 @@ SCENARIO_CFG_MAP = {
 # Reward shaping defaults are intentionally light for early tasks and richer for Deadly Corridor.
 SCENARIO_SHAPING_DEFAULTS = {
     "basic": {
-        "kill_reward": 5.0,
-        "ammo_penalty": 0.01,
+        "kill_reward": 20.0,
+        "ammo_penalty": 0.005,
         "progress_scale": 0.0,
         "health_penalty": 0.0,
+        "health_delta_scale": 0.0,
         "death_penalty": 0.0,
         "living_penalty": 0.0,
         "kill_grace_steps": 0,
         "forward_penalty": 0.0,
+        "damage_reward": 2.0,  # Reward for inflicting damage
     },
     "defend_the_center": {
-        "kill_reward": 5.0,
-        "ammo_penalty": 0.01,
+        "kill_reward": 10.0,
+        "ammo_penalty": 0.005,
         "progress_scale": 0.0,
-        "health_penalty": 0.0,
-        "death_penalty": 0.0,
+        "health_penalty": 0.1,
+        "health_delta_scale": 0.0,
+        "death_penalty": 2.0,
         "living_penalty": 0.0,
         "kill_grace_steps": 0,
         "forward_penalty": 0.0,
+        "damage_reward": 1.0,
     },
     "deadly_corridor": {
         # Stronger shaping to offset sparse rewards and punish early suicides.
@@ -76,10 +83,12 @@ SCENARIO_SHAPING_DEFAULTS = {
         "ammo_penalty": 0.02,
         "progress_scale": 0.05,  # Reward forward motion down the corridor.
         "health_penalty": 0.05,
+        "health_delta_scale": 0.0,
         "death_penalty": 5.0,
         "living_penalty": 0.0,
         "kill_grace_steps": 0,
         "forward_penalty": 0.0,
+        "damage_reward": 0.0,
     },
 }
 
@@ -133,11 +142,14 @@ class VizDoomGymnasiumEnv(gym.Env):
         self._register_shaping_variables()
         self.game.init()
 
-        # Define action space based on available buttons
-        n_buttons = len(self.game.get_available_buttons())
-        # Simple one-hot actions; later you can define a more compact action set
-        self._actions = np.eye(n_buttons, dtype=np.uint8)
-        self.action_space = gym.spaces.Discrete(len(self._actions))
+        # Define action space. Use curated combo sets when requested (size may vary by scenario).
+        if self.cfg.use_combo_actions:
+            self._actions = self._build_actions_by_scenario()
+            self.action_space = gym.spaces.Discrete(len(self._actions))
+        else:
+            n_buttons = len(self.game.get_available_buttons())
+            self._actions = np.eye(n_buttons, dtype=np.uint8)
+            self.action_space = gym.spaces.Discrete(len(self._actions))
 
         # Observation space: stacked grayscale frames (C, H, W), values in [0, 1]
         c = self.cfg.frame_stack
@@ -159,11 +171,13 @@ class VizDoomGymnasiumEnv(gym.Env):
         self.ammo_idx = self._find_var_index(vzd.GameVariable.AMMO2)
         self.progress_idx = self._find_var_index(vzd.GameVariable.POSITION_X)
         self.health_idx = self._find_var_index(vzd.GameVariable.HEALTH)
+        self.damage_idx = self._find_var_index(vzd.GameVariable.DAMAGECOUNT)
 
         self.prev_killcount = 0.0
         self.prev_ammo = 0.0
         self.prev_posx = 0.0
         self.prev_health = 0.0
+        self.prev_damage = 0.0
 
     def _register_shaping_variables(self):
         """
@@ -185,6 +199,8 @@ class VizDoomGymnasiumEnv(gym.Env):
         if self.cfg.health_penalty != 0.0 or self.scenario_name == "deadly_corridor":
             if vzd.GameVariable.HEALTH not in current:
                 requested.append(vzd.GameVariable.HEALTH)
+        if self.cfg.damage_reward != 0.0 and vzd.GameVariable.DAMAGECOUNT not in current:
+            requested.append(vzd.GameVariable.DAMAGECOUNT)
 
         for var in requested:
             self.game.add_available_game_variable(var)
@@ -197,6 +213,84 @@ class VizDoomGymnasiumEnv(gym.Env):
             if var == target_var:
                 return i
         return None
+
+    def _build_actions_by_scenario(self) -> np.ndarray:
+            """
+            Constructs action combos based on SHARED_ACTION_BUTTONS indices.
+            
+            SHARED_ACTION_BUTTONS = [
+                0: MOVE_FORWARD
+                1: MOVE_BACKWARD
+                2: TURN_LEFT
+                3: TURN_RIGHT
+                4: MOVE_LEFT
+                5: MOVE_RIGHT
+                6: ATTACK
+            ]
+            """
+            # Hardcoded indices matching SHARED_ACTION_BUTTONS
+            # (This is the only way to ensure the policy head matches the game buttons)
+            IDX_FWD = 0
+            IDX_BACK = 1
+            IDX_TURN_L = 2
+            IDX_TURN_R = 3
+            IDX_MOVE_L = 4
+            IDX_MOVE_R = 5
+            IDX_ATK = 6
+
+            # Helper to create the multi-hot vector
+            def make_action_row(*indices):
+                row = np.zeros(7, dtype=np.uint8)
+                for i in indices:
+                    row[i] = 1
+                return row
+
+            actions_list = []
+            name = self.scenario_name
+
+            if name == "basic":
+                # Basic: We want Strafe + Attack. 
+                # We explicitly exclude Turning to stop the "spinning" behavior during this phase,
+                # OR we include it but rely on the agent learning not to use it.
+                # Given your issue, let's include it but correct the mapping so Attack works.
+                actions_list = [
+                    make_action_row(),                  # 0: Idle
+                    make_action_row(IDX_MOVE_L),        # 1: Move Left
+                    make_action_row(IDX_MOVE_R),        # 2: Move Right
+                    make_action_row(IDX_ATK),           # 3: Attack
+                    make_action_row(IDX_MOVE_L, IDX_ATK), # 4: Move Left + Attack
+                    make_action_row(IDX_MOVE_R, IDX_ATK), # 5: Move Right + Attack
+                ]
+
+            elif name == "defend_the_center":
+                # Needs turning + attacking
+                actions_list = [
+                    make_action_row(),
+                    make_action_row(IDX_TURN_L),
+                    make_action_row(IDX_TURN_R),
+                    make_action_row(IDX_ATK),
+                    make_action_row(IDX_TURN_L, IDX_ATK),
+                    make_action_row(IDX_TURN_R, IDX_ATK),
+                ]
+
+            elif name == "deadly_corridor":
+                # Needs everything: Run&Gun, Strafe&Shoot, Turn&Shoot
+                actions_list = [
+                    make_action_row(),                      # Idle
+                    make_action_row(IDX_FWD),               # Move Fwd
+                    make_action_row(IDX_TURN_L),            # Turn Left
+                    make_action_row(IDX_TURN_R),            # Turn Right
+                    make_action_row(IDX_MOVE_L),            # Strafe Left
+                    make_action_row(IDX_MOVE_R),            # Strafe Right
+                    make_action_row(IDX_ATK),               # Attack
+                    make_action_row(IDX_FWD, IDX_ATK),      # Run & Gun (Vital for Corridor)
+                    make_action_row(IDX_MOVE_L, IDX_ATK),   # Strafe Left + Shoot
+                    make_action_row(IDX_MOVE_R, IDX_ATK),   # Strafe Right + Shoot
+                    make_action_row(IDX_TURN_L, IDX_ATK),   # Turn Left + Shoot
+                    make_action_row(IDX_TURN_R, IDX_ATK),   # Turn Right + Shoot
+                ]
+            
+            return np.array(actions_list, dtype=np.uint8)
 
     def _process_frame(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -267,6 +361,8 @@ class VizDoomGymnasiumEnv(gym.Env):
             self.prev_posx = float(vars_[self.progress_idx])
         if self.health_idx is not None:
             self.prev_health = float(vars_[self.health_idx])
+        if self.damage_idx is not None:
+            self.prev_damage = float(vars_[self.damage_idx])
 
     def _shape_reward(
         self,
@@ -336,7 +432,20 @@ class VizDoomGymnasiumEnv(gym.Env):
             lost = self.prev_health - health
             if lost > 0.0:
                 shaped -= self.cfg.health_penalty * lost
+        if self.health_idx is not None and self.cfg.health_delta_scale != 0.0:
+            health = float(vars_[self.health_idx])
+            delta_h = health - self.prev_health
+            if delta_h != 0.0:
+                shaped += self.cfg.health_delta_scale * delta_h
             self.prev_health = health
+
+        # Damage reward: encourage hitting enemies even if kills are sparse.
+        if self.damage_idx is not None and self.cfg.damage_reward != 0.0:
+            damage = float(vars_[self.damage_idx])
+            delta_damage = damage - self.prev_damage
+            if delta_damage > 0.0:
+                shaped += self.cfg.damage_reward * delta_damage
+            self.prev_damage = damage
 
         return shaped
 
@@ -612,6 +721,8 @@ def parse_args():
                         help="Number of game tics per action (lower = finer control, slower fps)")
 
     parser.add_argument("--render", action="store_true", help="Render first env window")
+    parser.add_argument("--use-combo-actions", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use curated combo actions (applies to all scenarios if set)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use-shared-actions", action=argparse.BooleanOptionalAction, default=True,
                         help="Use a unified action set across scenarios to keep policy heads compatible")
@@ -625,6 +736,8 @@ def parse_args():
                         help="Scale for POSITION_X progress reward (Deadly Corridor)")
     parser.add_argument("--health-penalty", type=float, default=None,
                         help="Penalty per point of health lost")
+    parser.add_argument("--health-delta-scale", type=float, default=None,
+                        help="Symmetric reward/penalty per point of health change (use 0 to disable)")
     parser.add_argument("--death-penalty", type=float, default=None,
                         help="Additional penalty when dying early")
     parser.add_argument("--living-penalty", type=float, default=None,
@@ -633,6 +746,8 @@ def parse_args():
                         help="Number of steps after a kill before living-penalty resumes")
     parser.add_argument("--forward-penalty", type=float, default=None,
                         help="Penalty per forward delta when no recent kill (discourages rushing past threats)")
+    parser.add_argument("--damage-reward", type=float, default=None,
+                        help="Reward per point of DAMAGECOUNT (damage inflicted) to encourage attacking")
 
     # PPO hyperparameters
     parser.add_argument("--learning-rate", type=float, default=2.5e-4)
@@ -646,6 +761,12 @@ def parse_args():
                         help="Normalize advantages")
     parser.add_argument("--clip-coef", type=float, default=0.1)
     parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument("--ent-coef-warm", type=float, default=None,
+                        help="Initial high entropy coefficient for Deadly warm-up")
+    parser.add_argument("--ent-warm-steps", type=int, default=0,
+                        help="Steps to hold ent_coefficient at warm value before decaying")
+    parser.add_argument("--ent-coef-final", type=float, default=None,
+                        help="Final entropy coefficient after warm-up/decay; defaults to --ent-coef")
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--target-kl", type=float, default=None)
@@ -703,31 +824,39 @@ def main():
     args.ammo_penalty = defaults["ammo_penalty"] if args.ammo_penalty is None else args.ammo_penalty
     args.progress_scale = defaults["progress_scale"] if args.progress_scale is None else args.progress_scale
     args.health_penalty = defaults["health_penalty"] if args.health_penalty is None else args.health_penalty
+    args.health_delta_scale = defaults["health_delta_scale"] if args.health_delta_scale is None else args.health_delta_scale
     args.death_penalty = defaults["death_penalty"] if args.death_penalty is None else args.death_penalty
     args.living_penalty = defaults["living_penalty"] if args.living_penalty is None else args.living_penalty
     args.kill_grace_steps = defaults["kill_grace_steps"] if args.kill_grace_steps is None else args.kill_grace_steps
     args.forward_penalty = defaults["forward_penalty"] if args.forward_penalty is None else args.forward_penalty
+    args.damage_reward = defaults["damage_reward"] if args.damage_reward is None else args.damage_reward
+    args.ent_coef_warm = args.ent_coef if args.ent_coef_warm is None else args.ent_coef_warm
+    args.ent_coef_final = args.ent_coef if args.ent_coef_final is None else args.ent_coef_final
 
     doom_cfg = DoomConfig(
         scenario_cfg=args.scenario_cfg,
         scenario_name=scenario_name,
+        use_combo_actions=args.use_combo_actions,
         use_shared_actions=args.use_shared_actions,
         frame_skip=args.frame_skip,
         kill_reward=args.kill_reward,
         ammo_penalty=args.ammo_penalty,
         progress_scale=args.progress_scale,
         health_penalty=args.health_penalty,
+        health_delta_scale=args.health_delta_scale,
         death_penalty=args.death_penalty,
         living_penalty=args.living_penalty,
         kill_grace_steps=args.kill_grace_steps,
         forward_penalty=args.forward_penalty,
+        damage_reward=args.damage_reward,
     )
 
     print(f"[INFO] Scenario '{scenario_name}' using cfg={args.scenario_cfg}")
     print("[INFO] Reward shaping "
           f"(kill={doom_cfg.kill_reward}, ammo_penalty={doom_cfg.ammo_penalty}, "
           f"progress_scale={doom_cfg.progress_scale}, health_penalty={doom_cfg.health_penalty}, "
-          f"death_penalty={doom_cfg.death_penalty})")
+          f"death_penalty={doom_cfg.death_penalty}, damage_reward={doom_cfg.damage_reward})")
+    print(f"[INFO] Actions: combo_actions={doom_cfg.use_combo_actions} | shared_buttons={doom_cfg.use_shared_actions}")
 
     # Basic asserts & setup
     assert args.num_steps > 0
@@ -774,9 +903,21 @@ def main():
         if not os.path.isfile(args.load_checkpoint):
             raise FileNotFoundError(f"Checkpoint not found: {args.load_checkpoint}")
         checkpoint = torch.load(args.load_checkpoint, map_location=device)
-        agent.load_state_dict(checkpoint["model_state_dict"])
-        if "optimizer_state_dict" in checkpoint:
+        ckpt_state = checkpoint["model_state_dict"]
+        # Drop incompatible actor head weights if action_space.n changed.
+        dropped_head = False
+        for key in ["actor.weight", "actor.bias"]:
+            if key in ckpt_state:
+                if key in agent.state_dict() and ckpt_state[key].shape != agent.state_dict()[key].shape:
+                    print(f"[WARN] Dropping incompatible {key} from checkpoint (ckpt {ckpt_state[key].shape} vs model {agent.state_dict()[key].shape})")
+                    ckpt_state.pop(key)
+                    dropped_head = True
+        # Load remaining weights
+        agent.load_state_dict(ckpt_state, strict=False)
+        if "optimizer_state_dict" in checkpoint and not dropped_head:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        elif dropped_head:
+            print("[WARN] Skipping optimizer_state_dict load due to action head size change; optimizer reinitialized.")
         global_step = int(checkpoint.get("global_step", 0))
         print(f"[INFO] Loaded checkpoint from {args.load_checkpoint} "
               f"(global_step={global_step})")
@@ -838,6 +979,19 @@ def main():
                 param_group["lr"] = lr_now
         else:
             lr_now = args.learning_rate
+        # Entropy schedule: hold at ent_coef_warm for ent_warm_steps, then decay to ent_coef_final.
+        ent_coef_now = args.ent_coef
+        warm_steps = args.ent_warm_steps
+        if warm_steps > 0:
+            steps_elapsed = max(global_step - initial_global_step, 0)
+            if steps_elapsed < warm_steps:
+                ent_coef_now = args.ent_coef_warm
+            else:
+                decay_steps = max(args.total_timesteps - warm_steps, 1)
+                frac_ent = min(max((steps_elapsed - warm_steps) / decay_steps, 0.0), 1.0)
+                ent_coef_now = args.ent_coef_warm + frac_ent * (args.ent_coef_final - args.ent_coef_warm)
+        else:
+            ent_coef_now = args.ent_coef
 
         # Collect rollout
         for step in range(args.num_steps):
@@ -1038,15 +1192,15 @@ def main():
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
 
-                    # Entropy bonus
-                    entropy_loss = entropy.mean()
+                # Entropy bonus
+                entropy_loss = entropy.mean()
 
-                    loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+                loss = pg_loss - ent_coef_now * entropy_loss + args.vf_coef * v_loss
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                    optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                optimizer.step()
 
                 if args.target_kl is not None and approx_kl > args.target_kl:
                     print(f"[INFO] Early stopping at epoch {epoch} due to KL={approx_kl:.5f}")
@@ -1117,7 +1271,7 @@ def main():
                     # Entropy bonus
                     entropy_loss = entropy.mean()
 
-                    loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+                    loss = pg_loss - ent_coef_now * entropy_loss + args.vf_coef * v_loss
 
                     optimizer.zero_grad()
                     loss.backward()
