@@ -6,10 +6,78 @@
 - Uses Gymnasium’s API with vectorized environments to keep throughput high while keeping the code path simple.
 - Reward shaping is scenario-aware to avoid the Deadly Corridor “suicide quickly” failure mode noted in Doom RL research.
 
+## Current Architecture & Experiment Log
+**Date:** 2025-12-04
+**Status:** Phase 1 (Basic) - Verification
+
+### Architecture Constraints (Source of Truth)
+1.  **Model:** PPO (CleanRL) + NatureCNN + LSTM.
+2.  **Action Space:** `MultiHotWrapper` over 7 shared buttons: `[FWD, BACK, TURN_L, TURN_R, STRAFE_L, STRAFE_R, ATK]`.
+    *   *Logic:* The wrapper maps discrete action indices to multi-hot vectors.
+    *   *Basic Scenario:* Uses a subset of combos (Idle, Move L, Move R, Attack, Move L+Atk, Move R+Atk).
+3.  **Normalization:**
+    *   **Advantage Normalization:** ENABLED (via `--norm-adv` flag).
+    *   **Return Normalization:** **DISABLED**. We use raw returns for value loss to preserve reward magnitude signals (critical for distinguishing high-reward events).
+
+### Current Configuration: `basic`
+*   **Scenario:** `configs/basic.cfg`
+*   **Reward Shaping:**
+    *   `kill_reward`: 10.0
+    *   `damage_reward`: 1.0 (Dense reward for aiming)
+    *   `ammo_penalty`: 0.005
+    *   `living_penalty`: 0.0
+*   **PPO Hyperparameters:**
+    *   `ent_coef`: 0.01 (Baseline)
+    *   `vf_coef`: 0.5
+    *   `learning_rate`: 2.5e-4
+    *   `gamma`: 0.99, `gae_lambda`: 0.95
+
+### Phase 1: Basic (Solved)
+- **Command:** `uv run python doom_ppo_deadly_corridor.py --scenario-cfg configs/basic.cfg --use-combo-actions --use-lstm --norm-adv --anneal-lr --ent-coef 0.01 --total-timesteps 1500000`
+- **Results:**
+    - **Mean Reward:** 100.96 (Max Possible: ~101)
+    - **Entropy:** Decayed to 0.05 (Deterministic Policy)
+    - **Value Loss:** ~0.3 (Stable Critic)
+- **Interpretation:** The agent has completely mastered the scenario, learning to immediately kill the monster. The low entropy indicates it is extremely confident in its policy (Move Left/Right + Attack).
+- **Checkpoint:** `checkpoints/basic_phase1_clean_basic_lstm_2025-12-04_14-10-21_seed42_step1499136.pt`
+
 ## Environment Setup (ViZDoom + Gymnasium + uv)
 - Dependencies are managed via `uv` (`pyproject.toml` + `uv.lock`). Run commands with `uv run python ...` to ensure the right environment.
 - ViZDoom configs and WADs live under `configs/` (e.g., `configs/basic.cfg`, `configs/defend_the_center.cfg`, `configs/deadly_corridor.cfg`).
 - The wrapper `VizDoomGymnasiumEnv` normalizes grayscale frames to `[0, 1]`, stacks 4 frames of size 84×84, and exposes a discrete one-hot action space aligned with the available buttons in each scenario.
+## Environment & Configuration Standards
+**Critical Update (2025-12-04):** We have standardized all `.cfg` files to ensure curriculum compatibility and prevent "double penalty" issues.
+
+### 1. Universal Action Space (The "7-Button" Rule)
+All configuration files (`basic.cfg`, `defend_the_center.cfg`, `deadly_corridor.cfg`) must expose the **exact same 7 buttons** in the **exact same order**. This ensures the Neural Network's policy head (which outputs 7 logits) remains valid when transferring checkpoints between scenarios.
+
+**Required Button List:**
+```ini
+available_buttons = {
+    MOVE_FORWARD
+    MOVE_BACKWARD
+    TURN_LEFT
+    TURN_RIGHT
+    MOVE_LEFT
+    MOVE_RIGHT
+    ATTACK
+}
+```
+
+### 2. "Python-First" Reward Logic (Zero-Sum Native Rewards)
+We have **silenced** the Doom Engine's native rewards to ensure Python is the Single Source of Truth for reward shaping.
+*   **Config Setting:** `living_reward = 0`, `death_penalty = 0`.
+*   **Reason:** Reward shaping is additive. If the engine gives `-1.0` and Python gives `-0.01`, the total is `-1.01`, which destroys fine-tuned incentives. By setting native rewards to 0, we avoid the "Double Penalty" trap that causes suicide loops.
+
+### 3. Variable Requirements
+To support our reward shaping wrapper, all configs must expose the following game variables:
+*   `KILLCOUNT`: For kill rewards.
+*   `DAMAGECOUNT`: For dense aiming rewards.
+*   `HEALTH`: For health loss penalties.
+*   `AMMO2`: For ammo usage penalties.
+
+### 4. Sensory Tuning
+For `defend_the_center` and `deadly_corridor`, we use `game_args = +m_yaw 20` to increase horizontal mouse sensitivity, enabling the rapid 180-degree turns required for survival.
 
 ## Neural Network Architecture
 - Feature extractor: NatureCNN
@@ -320,40 +388,7 @@ This log details the step-by-step process of diagnosing and fixing a common rein
 - **Solution:** To combat the unstable Critic, we are continuing training from the last checkpoint but with a significantly reduced **value function coefficient** (`--vf-coef 0.2`).
 - **Rationale:** By lowering `vf-coef`, we are reducing the weight of the `Loss_value` in the total loss function. This effectively tells the optimizer: "For now, don't trust the Critic's updates so much. Pay more attention to the Actor's updates, which are guided by the dense `damage_reward` we added." This should stabilize the shared layers of the neural network, allowing the policy to improve consistently while giving the critic more time to gradually learn a better value estimate from a more stable policy. The next training run's logs will be monitored for an increasing `ExplainedVar`, which will signal that this approach is working.
 
-## Debugging Log: The 'Stuck Shooter' Problem on Basic Scenario
-
-This log details the step-by-step process of diagnosing and fixing a common reinforcement learning problem where the agent adopted a suboptimal, repetitive behavior instead of learning the intended task.
-
-### 1. The Initial Problem: Suboptimal Local Minimum
-
-- **Observation:** When training on the `basic` scenario, the agent learned to move to the side of the arena and shoot continuously at a wall. It was not actively pursuing or killing the enemy.
-- **Interpretation:** The agent found a "local minimum" in its policy. This behavior, while not optimal, was "safe" and produced a consistent (though not good) outcome according to its flawed understanding of the environment. It learned that shooting was an action, but not how to connect that action to a successful outcome.
-
-### 2. Diagnosis Part 1: Sparse Rewards
-
-- **Investigation:** The initial training logs for the `basic` scenario showed the following reward shaping: `(kill=20.0, ammo_penalty=0.0075, ...)` and crucially, no `damage_reward`.
-- **Diagnosis:** This is a **sparse reward** problem. The agent only received a large positive reward upon successfully *killing* an enemy. Kills are infrequent for an untrained agent, so there can be hundreds of actions between rewards. This makes the **credit assignment problem** nearly impossible to solve; the agent cannot determine which of its many past actions were responsible for the eventual reward.
-- **Theoretical Explanation:** The goal of a reinforcement learning agent is to maximize the expected future discounted reward, $G_t = \sum_{k=0}^{\infty} \gamma^k R_{t+k+1}$. If the reward $R$ is almost always zero, the agent gets no gradient signal to update its policy. By providing smaller, more frequent (i.e., "dense") rewards for intermediate steps that lead to the goal, we provide a much clearer learning signal.
-- **Solution:** We introduced a **dense reward** by adding `damage_reward=1.0` to the default shaping for the `basic` scenario. This provides an immediate positive reward for the action of successfully hitting an enemy, directly solving the credit assignment problem for aiming.
-
-### 3. Anomaly & Diagnosis Part 2: The Evaluation Mismatch
-
-- **Observation:** After training with the new `damage_reward`, an evaluation run showed catastrophically bad performance (e.g., rewards of -300). This was contrary to the slight improvement seen during training.
-- **Investigation:** We compared the log output from the training script and the evaluation script.
-  - Training log: `... damage_reward=1.0 ...`
-  - Evaluation log: `... damage_reward` was missing.
-- **Diagnosis:** A bug was found where the evaluation script (`eval_doom_agent.py`) was not correctly loading or logging the `damage_reward` from the scenario defaults. The agent was being trained in one environment (with damage rewards) and evaluated in another (without them). Its policy was nonsensical in the evaluation environment, leading to the terrible scores.
-- **Solution:** The `eval_doom_agent.py` script was patched to correctly apply and log all reward shaping parameters, ensuring the training and evaluation environments were identical.
-
-### 4. Diagnosis Part 3: Unstable Value Function (Critic Failure)
-
-- **Observation:** After fixing the evaluation script, a new evaluation showed a "brittle" or unstable policy. In some episodes, the agent performed well and killed the enemy quickly. In others, it reverted to the old behavior of getting stuck. The skill was learned, but not applied reliably.
-- **Investigation:** We analyzed the training logs again, focusing on the `ExplainedVar` (Explained Variance) metric. Throughout the entire training run, `ExplainedVar` remained highly negative (e.g., -0.857 at the end).
-- **Diagnosis:** The core problem was an unstable **value function** (the "Critic" in our Actor-Critic model).
-- **Theoretical Explanation:** Explained Variance measures how well the Critic's predictions of future rewards match the actual rewards the agent received. A value of 1.0 is a perfect prediction; a negative value means the Critic's predictions are worse than simply guessing the average outcome. The PPO algorithm updates the policy (the "Actor") based on an "advantage" calculation, which is heavily dependent on the Critic's predictions (`Advantage ≈ Actual Reward - Predicted Reward`). If the Critic's predictions are garbage, the advantage calculation is also garbage, and the Actor receives a noisy, unreliable gradient. The agent literally cannot tell if its actions are leading to good or bad states.
-- **The PPO Loss Function:** The total loss is a combination of policy loss, value loss, and an entropy bonus: `Loss = Loss_policy + vf_coef * Loss_value - ent_coef * Loss_entropy`. In our case, `Loss_value` was massive and incorrect. Because it's part of the total loss, its huge, noisy gradients were likely overwhelming the smaller, more useful gradients from the policy and entropy losses, destabilizing the entire learning process.
-
-### 5. Current Solution: Stabilizing the Critic
-
-- **Solution:** To combat the unstable Critic, we are continuing training from the last checkpoint but with a significantly reduced **value function coefficient** (`--vf-coef 0.2`).
-- **Rationale:** By lowering `vf-coef`, we are reducing the weight of the `Loss_value` in the total loss function. This effectively tells the optimizer: "For now, don't trust the Critic's updates so much. Pay more attention to the Actor's updates, which are guided by the dense `damage_reward` we added." This should stabilize the shared layers of the neural network, allowing the policy to improve consistently while giving the critic more time to gradually learn a better value estimate from a more stable policy. The next training run's logs will be monitored for an increasing `ExplainedVar`, which will signal that this approach is working.
+- **Solution 2:** We implemented **Advantage Normalization (`--norm-adv`)**.
+  - **Advantage Normalization:** Advantages for the batch are normalized to mean 0, std 1 before the policy loss. This keeps policy updates scale-consistent.
+  - **Return Normalization:** **DISABLED**. We explicitly removed minibatch return normalization because it destroyed the Critic's ability to distinguish between high-reward and low-reward batches.
+- **Path Forward:** Retrain from the start (Basic → Defend → Deadly) with the new settings.

@@ -38,6 +38,7 @@ from doom_ppo_deadly_corridor import (
     PPOAgent,
     SCENARIO_CFG_MAP,
     SCENARIO_SHAPING_DEFAULTS,
+    SHARED_ACTION_BUTTONS,
 )
 
 
@@ -110,6 +111,12 @@ def parse_args():
         help="Optional delay (in seconds) between env steps during evaluation, e.g. 0.03",
     )
     parser.add_argument(
+        "--frame-skip",
+        type=int,
+        default=None,
+        help="Override frame skip for evaluation to match training (default: use scenario cfg)",
+    )
+    parser.add_argument(
         "--use-shared-actions",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -123,7 +130,7 @@ def parse_args():
     parser.add_argument(
         "--use-combo-actions",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Use curated combo actions (applies to all scenarios if set; must match training)",
     )
     parser.add_argument(
@@ -223,6 +230,7 @@ def build_eval_config(args) -> DoomConfig:
     return DoomConfig(
         scenario_cfg=args.scenario_cfg,
         scenario_name=scenario_name,
+        frame_skip=args.frame_skip if args.frame_skip is not None else 4,
         use_combo_actions=args.use_combo_actions,
         use_shared_actions=args.use_shared_actions,
         kill_reward=kill_reward,
@@ -331,6 +339,10 @@ def main():
     )
     render_mode = "human" if args.render else None
     env = VizDoomGymnasiumEnv(cfg, render_mode=render_mode)
+
+    if cfg.use_combo_actions:
+        print(f"[INFO] Action space size: {env.action_space.n} (Expected: {len(SHARED_ACTION_BUTTONS)})")
+
 
     # Gymnasium-style spaces from this single env
     obs_space = env.observation_space
