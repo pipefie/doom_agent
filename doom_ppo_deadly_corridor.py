@@ -43,6 +43,7 @@ class DoomConfig:
     kill_grace_steps: int = 0
     forward_penalty: float = 0.0
     damage_reward: float = 0.0
+    visible: bool = False
 
 
 SCENARIO_CFG_MAP = {
@@ -65,7 +66,7 @@ SCENARIO_SHAPING_DEFAULTS = {
         "damage_reward": 0.0,
     },
     "defend_the_center": {
-        "kill_reward": 1.0,
+        "kill_reward": 5.0,
         "ammo_penalty": 0.01,
         "progress_scale": 0.0,
         "health_penalty": 0.1,
@@ -74,19 +75,19 @@ SCENARIO_SHAPING_DEFAULTS = {
         "living_penalty": 0.0,
         "kill_grace_steps": 0,
         "forward_penalty": 0.0,
-        "damage_reward": 0.5,
+        "damage_reward": 0.01,
     },
     "deadly_corridor": {
-        "kill_reward": 2.0,
+        "kill_reward": 5.0,
         "ammo_penalty": 0.02,
-        "progress_scale": 0.01,
+        "progress_scale": 0.0005,
         "health_penalty": 0.05,
         "health_delta_scale": 0.0,
-        "death_penalty": 1.0,
+        "death_penalty": 5.0,
         "living_penalty": 0.0,
         "kill_grace_steps": 0,
         "forward_penalty": 0.0,
-        "damage_reward": 0.5,
+        "damage_reward": 0.05,
     },
 }
 
@@ -123,9 +124,7 @@ class VizDoomGymnasiumEnv(gym.Env):
             self.game.set_available_buttons(SHARED_ACTION_BUTTONS)
             
         self._register_shaping_variables()
-        self.game.set_window_visible(False)
-        if render_mode == "human":
-            self.game.set_window_visible(True)
+        self.game.set_window_visible(self.cfg.visible)
             
         self.game.init()
 
@@ -266,11 +265,14 @@ class VizDoomGymnasiumEnv(gym.Env):
             self.prev_ammo = ammo
 
         delta_x = 0.0
-        if self.progress_idx is not None:
-            px = float(vars_[self.progress_idx])
-            delta_x = px - self.prev_posx
-            if self.cfg.progress_scale != 0.0 and delta_x != 0.0: shaped += self.cfg.progress_scale * delta_x
-            self.prev_posx = px
+        if self.progress_idx is not None and self.cfg.progress_scale != 0.0:
+            p = float(vars_[self.progress_idx])
+            if p > self.max_posx:
+                shaped += self.cfg.progress_scale * (p - self.max_posx)
+                self.max_posx = p
+            # Note: We do NOT update self.prev_posx here anymore for reward purposes, 
+            # but we might need it for other logic if we had it. 
+            # For now, max_posx replaces the need for prev_posx in reward shaping.x
 
         if (self.cfg.forward_penalty > 0.0 and self.progress_idx is not None and 
                 delta_x > 0.0 and self.steps_since_kill > self.cfg.kill_grace_steps):
@@ -289,7 +291,10 @@ class VizDoomGymnasiumEnv(gym.Env):
         if self.damage_idx is not None and self.cfg.damage_reward != 0.0:
             d = float(vars_[self.damage_idx])
             delta_d = d - self.prev_damage
-            if delta_d > 0.0: shaped += self.cfg.damage_reward * delta_d
+            if delta_d > 0.0: 
+                r_damage = -self.cfg.damage_reward * delta_d
+                shaped += r_damage
+                # print(f"[DEBUG] Damage Penalty: {r_damage} (Delta: {delta_d})")
             self.prev_damage = d
 
         return shaped
@@ -303,10 +308,16 @@ class VizDoomGymnasiumEnv(gym.Env):
         processed = self._process_frame(frame)
         for i in range(self.cfg.frame_stack): self._frames[i] = processed
         self._update_game_vars(state)
+        if self.progress_idx is not None:
+            self.max_posx = self.prev_posx
         return self._get_obs(), {}
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, dict]:
-        base_reward = self.game.make_action(self._actions[action].tolist(), self.cfg.frame_skip)
+        # [CRITICAL] Ignore native WAD rewards (distance/shaping) to prevent "Exploding Reward".
+        # We rely strictly on Python-side shaping (Kill, Progress, Damage).
+        self.game.make_action(self._actions[action].tolist(), self.cfg.frame_skip)
+        base_reward = 0.0 
+        
         terminated = self.game.is_episode_finished()
         truncated = False
 
@@ -346,9 +357,11 @@ class VizDoomGymnasiumEnv(gym.Env):
 # 3. Env factory (vectorized)
 # =========================
 
-def make_vizdoom_env(base_cfg: DoomConfig, seed: int, idx: int, run_name: str):
+def make_vizdoom_env(base_cfg: DoomConfig, seed: int, idx: int, run_name: str, visual_envs: list):
     def thunk():
         env_cfg = DoomConfig(**asdict(base_cfg))
+        if idx in visual_envs:
+            env_cfg.visible = True
         render_mode = "rgb_array" if idx == 0 else None
         env = VizDoomGymnasiumEnv(env_cfg, render_mode=render_mode)
         # Note: We REMOVED RecordEpisodeStatistics here to use manual tracking
@@ -368,8 +381,7 @@ def make_vizdoom_env(base_cfg: DoomConfig, seed: int, idx: int, run_name: str):
 
 def make_envs(args, doom_cfg: DoomConfig, run_name: str):
     return gym.vector.SyncVectorEnv(
-        [make_vizdoom_env(base_cfg=doom_cfg, seed=args.seed, idx=i, run_name=run_name) 
-         for i in range(args.num_envs)]
+        [make_vizdoom_env(doom_cfg, args.seed, i, run_name, args.visual_envs) for i in range(args.num_envs)]
     )
 
 
@@ -467,6 +479,7 @@ def parse_args():
     parser.add_argument("--kill-grace-steps", type=int, default=None)
     parser.add_argument("--forward-penalty", type=float, default=None)
     parser.add_argument("--damage-reward", type=float, default=None)
+    parser.add_argument("--visual-envs", type=int, nargs="+", default=[], help="List of env indices to show (e.g. 0 1)")
     # PPO
     parser.add_argument("--learning-rate", type=float, default=2.5e-4)
     parser.add_argument("--anneal-lr", action="store_true")
@@ -549,9 +562,22 @@ def main():
         if os.path.isfile(args.load_checkpoint):
             print(f"[INFO] Loading checkpoint from {args.load_checkpoint}...")
             checkpoint = torch.load(args.load_checkpoint, map_location=device)
-            # We only load the model weights, not the optimizer, to allow for a fresh start in the new scenario
-            agent.load_state_dict(checkpoint["model_state_dict"])
-            print("[INFO] Checkpoint loaded successfully (Agent weights only).")
+            
+            # Flexible Loading Logic
+            model_state = agent.state_dict()
+            pretrained_state = checkpoint["model_state_dict"]
+            
+            # Filter out mismatched keys (e.g., actor.weight, critic.weight)
+            matched_state = {k: v for k, v in pretrained_state.items() 
+                             if k in model_state and v.shape == model_state[k].shape}
+            
+            ignored_keys = [k for k in pretrained_state.keys() if k not in matched_state]
+            if ignored_keys:
+                print(f"[WARNING] Ignored keys due to shape mismatch: {ignored_keys}")
+            
+            # Load only the matched weights
+            agent.load_state_dict(matched_state, strict=False)
+            print("[INFO] Checkpoint loaded successfully (Partial load).")
         else:
             print(f"[ERROR] Checkpoint file not found: {args.load_checkpoint}")
             exit(1)

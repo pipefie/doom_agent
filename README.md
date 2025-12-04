@@ -41,9 +41,38 @@
 - **Interpretation:** The agent has completely mastered the scenario, learning to immediately kill the monster. The low entropy indicates it is extremely confident in its policy (Move Left/Right + Attack).
 - **Checkpoint:** `checkpoints/basic_phase1_clean_basic_lstm_2025-12-04_14-10-21_seed42_step1499136.pt`
 
+### Phase 2: Defend the Center (Solved)
+- **Command:** `uv run python doom_ppo_deadly_corridor.py --scenario-cfg configs/defend_the_center.cfg --load-checkpoint [Phase 1 Checkpoint] --use-combo-actions --use-lstm --norm-adv --anneal-lr --ent-coef 0.015 --total-timesteps 2000000`
+- **Results:**
+    - **Mean Reward:** ~60 (Max: ~111)
+    - **Entropy:** ~0.7-0.8 (Healthy Exploration)
+    - **Performance:** Agent consistently survives and kills multiple enemies.
+- **Interpretation:** The agent successfully transferred its aiming skills. The higher entropy (compared to Basic) is positive, showing the agent maintains the necessary stochasticity to scan for enemies in a 360-degree environment rather than collapsing into a single action. The variance in rewards (60 vs 111) reflects the inherent difficulty of the scenario (getting overwhelmed vs clearing the wave).
+- **Checkpoint:** `checkpoints/defend_center_phase2_defend_the_center_lstm_2025-12-04_16-21-49_seed42_step1999872.pt`
+
 ## Environment Setup (ViZDoom + Gymnasium + uv)
 - Dependencies are managed via `uv` (`pyproject.toml` + `uv.lock`). Run commands with `uv run python ...` to ensure the right environment.
 - ViZDoom configs and WADs live under `configs/` (e.g., `configs/basic.cfg`, `configs/defend_the_center.cfg`, `configs/deadly_corridor.cfg`).
+
+## Technical Challenges & Solutions
+
+### Action Space Mismatch (Curriculum Transfer)
+- **Problem:** Transferring from `defend_the_center` (6 actions) to `deadly_corridor` (12 actions) caused a `RuntimeError` due to shape mismatch in the Policy Head (`actor.weight`).
+- **Solution:** Implemented **Flexible Checkpoint Loading** in `doom_ppo_deadly_corridor.py`. The script now performs a "Partial Load":
+    1.  **Loads** compatible layers (CNN Feature Extractor, LSTM Memory, Critic).
+    2.  **Skips** mismatched layers (Actor/Policy Head).
+    3.  **Re-initializes** the skipped layers to learn the new action space from scratch.
+- **Result:** Enables seamless transfer learning across scenarios with different control schemes (e.g., Turret -> Moving Agent).
+
+### Exploding Reward (Native WAD Conflict)
+- **Problem:** In `deadly_corridor`, the agent received massive, noisy rewards (e.g., +20, -20 per step) even without killing enemies. This caused "suicide rushing" as the agent surfed the native reward function.
+- **Root Cause:** The WAD has a built-in distance-based reward system that conflicted with our Python-side `progress_scale`.
+- **Solution:** Enforced **"Python-First" Rewards** by explicitly zeroing out the game engine's `base_reward` in `step()`:
+    ```python
+    self.game.make_action(...)
+    base_reward = 0.0 # Ignore native rewards
+    ```
+- **Result:** The agent now relies 100% on our calibrated shaping (Kill, Max Progress, Damage Penalty), eliminating the noise.
 - The wrapper `VizDoomGymnasiumEnv` normalizes grayscale frames to `[0, 1]`, stacks 4 frames of size 84×84, and exposes a discrete one-hot action space aligned with the available buttons in each scenario.
 ## Environment & Configuration Standards
 **Critical Update (2025-12-04):** We have standardized all `.cfg` files to ensure curriculum compatibility and prevent "double penalty" issues.
@@ -392,3 +421,8 @@ This log details the step-by-step process of diagnosing and fixing a common rein
   - **Advantage Normalization:** Advantages for the batch are normalized to mean 0, std 1 before the policy loss. This keeps policy updates scale-consistent.
   - **Return Normalization:** **DISABLED**. We explicitly removed minibatch return normalization because it destroyed the Critic's ability to distinguish between high-reward and low-reward batches.
 - **Path Forward:** Retrain from the start (Basic → Defend → Deadly) with the new settings.
+
+
+## command use to run succesfully the basic training
+
+uv run python doom_ppo_deadly_corridor.py   --scenario-name basic   --exp-name basic_phase1_clean  --use-combo-actions   --use-lstm --lstm-hidden-size 512   --frame-skip 4   --num-envs 8 --num-steps 128 --num-minibatches 4   --total-timesteps 1500000 --learning-rate 2.5e-4  --ent-coef 0.015   --vf-coef 0.5   --norm-adv   --anneal-lr   --cuda   --track
