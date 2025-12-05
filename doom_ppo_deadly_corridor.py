@@ -43,6 +43,7 @@ class DoomConfig:
     kill_grace_steps: int = 0
     forward_penalty: float = 0.0
     damage_reward: float = 0.0
+    completion_reward: float = 0.0
     visible: bool = False
 
 
@@ -80,7 +81,7 @@ SCENARIO_SHAPING_DEFAULTS = {
     "deadly_corridor": {
         "kill_reward": 5.0,
         "ammo_penalty": 0.02,
-        "progress_scale": 0.0005,
+        "progress_scale": 0.005,
         "health_penalty": 0.05,
         "health_delta_scale": 0.0,
         "death_penalty": 5.0,
@@ -88,17 +89,30 @@ SCENARIO_SHAPING_DEFAULTS = {
         "kill_grace_steps": 0,
         "forward_penalty": 0.0,
         "damage_reward": 0.05,
+        "completion_reward": 100.0,
     },
+    "health_gathering_supreme": {
+        "kill_reward": 0.0,         # No enemies
+        "ammo_penalty": 0.0,        # No shooting
+        "progress_scale": 0.0,
+        "health_penalty": 0.0,      # Death is penalty enough
+        "health_delta_scale": 0.0,
+        "death_penalty": 1.0,       # Small penalty for dying
+        "living_penalty": -0.1,     # NEGATIVE penalty = POSITIVE reward for surviving!
+        "kill_grace_steps": 0,
+        "forward_penalty": 0.0,
+        "damage_reward": 0.0,
+    },   
 }
 
 SHARED_ACTION_BUTTONS = [
-    vzd.Button.MOVE_FORWARD,
-    vzd.Button.MOVE_BACKWARD,
-    vzd.Button.TURN_LEFT,
-    vzd.Button.TURN_RIGHT,
-    vzd.Button.MOVE_LEFT,
-    vzd.Button.MOVE_RIGHT,
-    vzd.Button.ATTACK,
+    vzd.Button.MOVE_FORWARD, #idx 1
+    vzd.Button.MOVE_BACKWARD, #idx 2
+    vzd.Button.TURN_LEFT, #idx 3
+    vzd.Button.TURN_RIGHT, #idx 4
+    vzd.Button.MOVE_LEFT, #idx 5
+    vzd.Button.MOVE_RIGHT, #idx 6
+    vzd.Button.ATTACK, #idx 7
 ]
 
 
@@ -179,6 +193,7 @@ class VizDoomGymnasiumEnv(gym.Env):
         return None
 
     def _build_actions_by_scenario(self) -> np.ndarray:
+        # 0: FWD, 1: BACK, 2: TL, 3: TR, 4: ML, 5: MR, 6: ATK
         def make_action_row(*indices):
             row = np.zeros(7, dtype=np.uint8)
             for i in indices: row[i] = 1
@@ -204,20 +219,44 @@ class VizDoomGymnasiumEnv(gym.Env):
                 make_action_row(2, 6),              
                 make_action_row(3, 6),              
             ]
-        elif name == "deadly_corridor":
+        elif name == "health_gathering_supreme":
+            # TRANSFER LEARNING SETUP (Size 12)
+            # We map the "Shooting" combos from Corridor to "Movement" only.
+            # This allows the agent to use its existing "Run & Gun" policy 
+            # to simply "Run" in the maze.
             actions_list = [
-                make_action_row(),                  
-                make_action_row(0),                 
-                make_action_row(2),                 
-                make_action_row(3),                 
-                make_action_row(4),                 
-                make_action_row(5),                 
-                make_action_row(6),                 
-                make_action_row(0, 6),              
-                make_action_row(4, 6),              
-                make_action_row(5, 6),              
-                make_action_row(2, 6),              
-                make_action_row(3, 6),              
+                make_action_row(),                      # 0: Idle
+                make_action_row(0),                     # 1: Fwd
+                make_action_row(2),                     # 2: Turn L
+                make_action_row(3),                     # 3: Turn R
+                make_action_row(4),                     # 4: Strafe L
+                make_action_row(5),                     # 5: Strafe R
+                
+                # MAPPED COMBAT ACTIONS (The Trick)
+                make_action_row(),                      # 6: (Was Atk) -> Idle
+                make_action_row(0),                     # 7: (Was Fwd+Atk) -> Fwd
+                make_action_row(4),                     # 8: (Was ML+Atk) -> Strafe L
+                make_action_row(5),                     # 9: (Was MR+Atk) -> Strafe R
+                make_action_row(2),                     # 10: (Was TL+Atk) -> Turn L
+                make_action_row(3),                     # 11: (Was TR+Atk) -> Turn R
+            ]
+
+        elif name == "deathmatch_simple" or name == "deadly_corridor":
+            # The Standard Combat Set (Size 12)
+            # Used for both Corridor and Deathmatch
+            actions_list = [
+                make_action_row(),                      # 0
+                make_action_row(0),                     # 1: Fwd
+                make_action_row(2),                     # 2: TL
+                make_action_row(3),                     # 3: TR
+                make_action_row(4),                     # 4: ML
+                make_action_row(5),                     # 5: MR
+                make_action_row(6),                     # 6: Atk
+                make_action_row(0, 6),                  # 7: Fwd+Atk
+                make_action_row(4, 6),                  # 8: ML+Atk
+                make_action_row(5, 6),                  # 9: MR+Atk
+                make_action_row(2, 6),                  # 10: TL+Atk
+                make_action_row(3, 6),                  # 11: TR+Atk
             ]
         return np.array(actions_list, dtype=np.uint8)
 
@@ -246,7 +285,13 @@ class VizDoomGymnasiumEnv(gym.Env):
     def _shape_reward(self, base_reward: float, state: vzd.GameState | None, terminated: bool) -> float:
         shaped = base_reward
         if state is None:
-            if terminated and self.cfg.death_penalty != 0.0: shaped -= self.cfg.death_penalty
+            # Terminated
+            if terminated:
+                if self.game.is_player_dead():
+                    if self.cfg.death_penalty != 0.0: shaped -= self.cfg.death_penalty
+                else:
+                    # Victory! (Terminated but not dead)
+                    if self.cfg.completion_reward != 0.0: shaped += self.cfg.completion_reward
             return shaped
 
         vars_ = state.game_variables
@@ -479,6 +524,7 @@ def parse_args():
     parser.add_argument("--kill-grace-steps", type=int, default=None)
     parser.add_argument("--forward-penalty", type=float, default=None)
     parser.add_argument("--damage-reward", type=float, default=None)
+    parser.add_argument("--completion-reward", type=float, default=None)
     parser.add_argument("--visual-envs", type=int, nargs="+", default=[], help="List of env indices to show (e.g. 0 1)")
     # PPO
     parser.add_argument("--learning-rate", type=float, default=2.5e-4)
