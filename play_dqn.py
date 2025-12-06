@@ -54,7 +54,7 @@ if __name__ == "__main__":
 
     # Crear entorno
     try:
-        env = make_visual_env("basic.cfg")
+        env = make_visual_env("configs/basic.cfg")
     except Exception as e:
         print(f"Error al crear entorno: {e}")
         exit()

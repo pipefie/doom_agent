@@ -29,13 +29,13 @@ class Args:
     capture_video: bool = False
 
     # Configuración del escenario
-    scenario_path: str = "basic.cfg"
+    scenario_path: str = "configs/basic.cfg"
     total_timesteps: int = 500000
     learning_rate: float = 2.5e-4
     
     # --- Argumentos específicos de DQN ---
     num_envs: int = 1  # DQN suele funcionar mejor con 1 env, pero soporta vectorizado
-    buffer_size: int = 100000  # Memoria de repetición
+    buffer_size: int = 25000  # Memoria de repetición
     gamma: float = 0.99
     tau: float = 1.0  # 1.0 = Hard update (copia total), < 1.0 = Soft update
     target_network_frequency: int = 1000  # Cada cuánto actualizamos la red objetivo

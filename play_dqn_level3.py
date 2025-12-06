@@ -54,7 +54,7 @@ if __name__ == "__main__":
 
     # Crear entorno
     try:
-        env = make_visual_env("deadly_corridor.cfg")
+        env = make_visual_env("configs/deadly_corridor.cfg")
     except Exception as e:
         print(f"Error al crear entorno: {e}")
         exit()

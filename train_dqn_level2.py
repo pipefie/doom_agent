@@ -29,7 +29,7 @@ class Args:
     capture_video: bool = False
 
     # Configuración del escenario
-    scenario_path: str = "defend_the_center.cfg"
+    scenario_path: str = "configs/defend_the_center.cfg"
 
     # Partimos con la base de lo aprendido en el primer modo de juego del Doom
     load_model: str = "doom_dqn_model.pth"
@@ -40,7 +40,7 @@ class Args:
     
     # --- Argumentos específicos de DQN ---
     num_envs: int = 1  # DQN suele funcionar mejor con 1 env, pero soporta vectorizado
-    buffer_size: int = 100000  # Memoria de repetición
+    buffer_size: int = 25000  # Memoria de repetición
     gamma: float = 0.99
     tau: float = 1.0  # 1.0 = Hard update (copia total), < 1.0 = Soft update
     target_network_frequency: int = 1000  # Cada cuánto actualizamos la red objetivo

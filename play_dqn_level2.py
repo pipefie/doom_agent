@@ -54,7 +54,7 @@ if __name__ == "__main__":
 
     # Crear entorno
     try:
-        env = make_visual_env("defend_the_center.cfg")
+        env = make_visual_env("configs/defend_the_center.cfg")
     except Exception as e:
         print(f"Error al crear entorno: {e}")
         exit()

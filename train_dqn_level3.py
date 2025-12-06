@@ -29,7 +29,7 @@ class Args:
     capture_video: bool = False
 
     # Configuración del escenario
-    scenario_path: str = "deadly_corridor.cfg"
+    scenario_path: str = "configs/deadly_corridor.cfg"
 
     # Partimos con la base de lo aprendido en el segundo modo de juego del Doom
     load_model: str = "doom_dqn_level2.pth"
