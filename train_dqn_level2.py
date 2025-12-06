@@ -1,4 +1,4 @@
-# train_dqn.py
+# train_dqn_level2.py
 import os
 import random
 import time

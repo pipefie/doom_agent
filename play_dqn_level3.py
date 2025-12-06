@@ -1,4 +1,4 @@
-# play_dqn.py
+# play_dqn_level3.py
 import time
 import gymnasium as gym
 import vizdoom as vzd

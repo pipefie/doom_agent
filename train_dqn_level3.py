@@ -1,4 +1,4 @@
-# train_dqn.py
+# train_dqn_level3.py
 import os
 import random
 import time
@@ -40,7 +40,7 @@ class Args:
     
     # --- Argumentos específicos de DQN ---
     num_envs: int = 1  # DQN suele funcionar mejor con 1 env, pero soporta vectorizado
-    buffer_size: int = 100000  # Memoria de repetición
+    buffer_size: int = 25000  # Memoria de repetición
     gamma: float = 0.99
     tau: float = 1.0  # 1.0 = Hard update (copia total), < 1.0 = Soft update
     target_network_frequency: int = 1000  # Cada cuánto actualizamos la red objetivo
@@ -145,13 +145,23 @@ if __name__ == "__main__":
     if args.use_pretrained and os.path.exists(args.load_model): 
         print(f"Cargando modelo pre-entrenado desde: {args.load_model}") 
         try: 
-            state_dict = torch.load(args.load_model, map_location=device)
-
-            q_network.load_state_dict(state_dict) 
-            print("¡Pesos cargados correctamente!") 
+            # 1. Cargar el archivo
+            pretrained_dict = torch.load(args.load_model, map_location=device)
+            
+            # 2. Obtener el estado actual de la nueva red (Level 3)
+            model_dict = q_network.state_dict()
+            
+            # 3. Filtrar: Quedarnos solo con las capas que tienen el mismo tamaño
+            # Esto eliminará la última capa lineal si el número de acciones cambió
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and v.size() == model_dict[k].size()}
+            
+            # 4. Actualizar y cargar
+            model_dict.update(pretrained_dict)
+            q_network.load_state_dict(model_dict)
+            
+            print(f"¡Pesos cargados! (Se han ignorado las capas con diferente tamaño de acciones)") 
         except Exception as e:
-            print(f"Error cargando pesos (quizás diferente arquitectura): {e}") 
-            # Si falla seguimos con pesos aleatorios
+            print(f"Error crítico cargando pesos: {e}") 
 
     target_network.load_state_dict(q_network.state_dict()) # Copia inicial
 
