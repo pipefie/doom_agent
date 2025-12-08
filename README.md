@@ -50,6 +50,55 @@
 - **Interpretation:** The agent successfully transferred its aiming skills. The higher entropy (compared to Basic) is positive, showing the agent maintains the necessary stochasticity to scan for enemies in a 360-degree environment rather than collapsing into a single action. The variance in rewards (60 vs 111) reflects the inherent difficulty of the scenario (getting overwhelmed vs clearing the wave).
 - **Checkpoint:** `checkpoints/defend_center_phase2_defend_the_center_lstm_2025-12-04_16-21-49_seed42_step1999872.pt`
 
+### Phase 4: Health Gathering Supreme: **SOLVED.**
+- **Challenge:** Survive in a maze with acid floors and decreasing health. No enemies.
+- **Solution:** `living_penalty = -0.1` (Reward for surviving), `health_delta_scale = 0.1` (Reward for healing).
+- **Result:** Mean Return ~22.0, Max ~60.0. The agent learned to navigate and collect health packs.
+- **Key Insight:** We re-mapped the "Run & Gun" neuron (Index 7) to "Move Forward", allowing the agent to transfer its movement preference from Phase 3.
+
+- **Phase 5: Deathmatch Simple:** **IN PROGRESS.**
+    - **Goal:** Kill enemies in a complex 3D map using `autoaim`.
+    - **Phase 5.1 (Failed):** "The Wall Spam Incident".
+        - *Settings:* `ammo_penalty=0.0`, `living_penalty=0.0`.
+        - *Result:* Agent hoarded ammo and punched walls. Zero cost to exist/shoot led to lazy local optima.
+    - **Phase 5.2 (Failed):** "Tactical Aggression".
+        - *Settings:* `ammo_penalty=0.005`, `living_penalty=0.05`.
+        - *Result:* Agent still spammed walls. The penalty was too low to discourage waste.
+    - **Phase 5.3 (Failed):** "The Sniper Economy".
+        - *Settings:* `ammo_penalty=0.5`.
+        - *Result:* Agent became a pacifist. Too afraid to shoot.
+    - **Phase 5.4 (Failed):** "Balanced Economy".
+        - *Settings:* `ammo_penalty=0.02`, `living_penalty=0.01`.
+        - *Result:* Agent evolved into a "Camper". Hides in health room, spams door. Profitable but boring.
+    - **Phase 5.5 (Failed):** "The Hunter Economy".
+        - *Settings:* `living_penalty=0.1`, `ammo_penalty=0.1`.
+        - *Result:* User felt ammo penalty was too high. Agent still humped walls (remnant of Phase 4).
+    - **Phase 5.6 (Failed):** "Anti-Wall-Humping".
+        - *Settings:* `wall_penalty=0.5`.
+        - *Result:* Agent stopped humping but didn't fight back effectively.
+    - **Phase 5.7 (Current):** "The Revenge Mechanic" (Pain Rage).
+        - *Problem:* Agent exhibited two major flaws:
+            1.  **Wall Humping:** Persistently trying to run through walls (remnant of Phase 4 "Runner" brain).
+            2.  **Passive Victim:** Taking damage without turning to face the attacker (lack of "Killer Radar").
+        - *Solution:*
+            1.  **Anti-Wall-Humping (`wall_penalty=0.5`):** If the agent presses a Move key but its position doesn't change (distance < 2.0), it gets penalized. This forces it to learn that "Pushing Wall = Bad", "Turning = Good".
+            2.  **Pain Rage (`pain_rage_multiplier=4.0`):** When the agent takes damage, it enters "Rage Mode" for ~2 seconds (70 steps). During this window, **Kill Reward** and **Damage Reward** are multiplied by **4x**.
+        - *Hypothesis:* The massive financial incentive to kill *immediately* after being hurt will train the agent to snap-turn towards damage sources, effectively creating a "Radar of Killing" behavior.
+    - **Phase 5.8 (Current):** "Calculated Risk" (Survivor's Rage).
+        - *Problem:* Phase 5.7 succeeded too well. The agent became a "Kamikaze", trading its life for high-value "Rage Kills" (40pts vs 5pts death penalty). Episodic length crashed as it rushed into death.
+        - *Solution:*
+            1.  **Increase Death Penalty:** 5.0 -> **25.0**. Dying now wipes out the profit of a single Rage Kill.
+            2.  **Tune Rage:** `pain_rage_multiplier` 4.0 -> **3.0**. Still profitable, but less "all-in".
+            3.  **Health Cost:** `health_penalty` 0.05 -> **0.1**.
+            4.  **Boost Kill Reward:** 10.0 -> **15.0**. To ensure that *surviving* and killing is significantly more profitable than dying.
+        - *Hypothesis:* By making death expensive, we force the agent to use its "Rage" for *survival* (killing the threat to stop the pain) rather than *suicide* (trading life for points).
+    - **Phase 5.9 (Current):** "The Survivalist" (Resource Awareness).
+        - *Problem:* The agent became a "Temerary Killing Machine" (reckless). It kills effectively but ignores health and ammo pickups, eventually running dry and dying. It doesn't understand that *resources = life*.
+        - *Solution:*
+            1.  **Ammo Reward (`ammo_reward=0.05`):** Explicitly reward gaining ammo. Picking up a clip (10 bullets) is now worth 0.5 points.
+            2.  **Health Reward (`health_delta_scale=0.05`):** Explicitly reward gaining health. Picking up a medkit (25hp) is now worth 1.25 points.
+        - *Hypothesis:* By attaching immediate positive value to resource acquisition, we teach the agent that scavenging is a valid and profitable sub-objective, creating a loop of "Kill -> Scavenge -> Kill".
+
 ## Environment Setup (ViZDoom + Gymnasium + uv)
 - Dependencies are managed via `uv` (`pyproject.toml` + `uv.lock`). Run commands with `uv run python ...` to ensure the right environment.
 - ViZDoom configs and WADs live under `configs/` (e.g., `configs/basic.cfg`, `configs/defend_the_center.cfg`, `configs/deadly_corridor.cfg`).

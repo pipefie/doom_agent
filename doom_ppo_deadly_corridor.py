@@ -35,6 +35,7 @@ class DoomConfig:
     # Reward shaping
     kill_reward: float = 5.0
     ammo_penalty: float = 0.01
+    ammo_reward: float = 0.0 # Reward for picking up ammo
     progress_scale: float = 0.0
     health_penalty: float = 0.0
     health_delta_scale: float = 0.0
@@ -42,8 +43,11 @@ class DoomConfig:
     living_penalty: float = 0.0
     kill_grace_steps: int = 0
     forward_penalty: float = 0.0
+    wall_penalty: float = 0.0
     damage_reward: float = 0.0
     completion_reward: float = 0.0
+    pain_rage_multiplier: float = 1.0 # Multiplier for kill/damage rewards after taking damage
+
     visible: bool = False
 
 
@@ -51,6 +55,8 @@ SCENARIO_CFG_MAP = {
     "basic": "configs/basic.cfg",
     "defend_the_center": "configs/defend_the_center.cfg",
     "deadly_corridor": "configs/deadly_corridor.cfg",
+    "health_gathering_supreme": "configs/health_gathering_supreme.cfg",
+    "deathmatch_simple": "configs/deathmatch_simple.cfg",
 }
 
 SCENARIO_SHAPING_DEFAULTS = {
@@ -96,13 +102,28 @@ SCENARIO_SHAPING_DEFAULTS = {
         "ammo_penalty": 0.0,        # No shooting
         "progress_scale": 0.0,
         "health_penalty": 0.0,      # Death is penalty enough
-        "health_delta_scale": 0.0,
+        "health_delta_scale": 0.1,
         "death_penalty": 1.0,       # Small penalty for dying
         "living_penalty": -0.1,     # NEGATIVE penalty = POSITIVE reward for surviving!
         "kill_grace_steps": 0,
         "forward_penalty": 0.0,
         "damage_reward": 0.0,
-    },   
+    },
+    "deathmatch_simple": {
+        "kill_reward": 15.0,        # High reward for kills.
+        "ammo_penalty": 0.05,       # Moderate penalty.
+        "progress_scale": 0.0,
+        "health_penalty": 0.1,      # Fear pain.
+        "health_delta_scale": 0.05, # NEW: Reward for healing (25hp = 1.25).
+        "death_penalty": 25.0,      # Fear death.
+        "living_penalty": 0.01,     # Low rent.
+        "kill_grace_steps": 0,
+        "forward_penalty": 0.0,
+        "damage_reward": 2.0,       # Reward hitting.
+        "wall_penalty": 0.5,        # Penalty for moving without going anywhere.
+        "pain_rage_multiplier": 3.0, # 3x Reward for violence after getting hurt.
+        "ammo_reward": 0.05,        # NEW: Reward for scavenging ammo (10 bullets = 0.5).
+    },
 }
 
 SHARED_ACTION_BUTTONS = [
@@ -165,12 +186,18 @@ class VizDoomGymnasiumEnv(gym.Env):
         self.progress_idx = self._find_var_index(vzd.GameVariable.POSITION_X)
         self.health_idx = self._find_var_index(vzd.GameVariable.HEALTH)
         self.damage_idx = self._find_var_index(vzd.GameVariable.DAMAGECOUNT)
+        self.posx_idx = self._find_var_index(vzd.GameVariable.POSITION_X)
+        self.posy_idx = self._find_var_index(vzd.GameVariable.POSITION_Y)
 
         self.prev_killcount = 0.0
         self.prev_ammo = 0.0
         self.prev_posx = 0.0
         self.prev_health = 0.0
         self.prev_damage = 0.0
+        self.prev_pos_x = 0.0
+        self.prev_pos_y = 0.0
+        self.max_posx = -99999.0
+        self._last_action_idx = -1
 
     def _register_shaping_variables(self):
         current = set(self.game.get_available_game_variables())
@@ -185,6 +212,9 @@ class VizDoomGymnasiumEnv(gym.Env):
             if vzd.GameVariable.HEALTH not in current: requested.append(vzd.GameVariable.HEALTH)
         if self.cfg.damage_reward != 0.0 and vzd.GameVariable.DAMAGECOUNT not in current:
             requested.append(vzd.GameVariable.DAMAGECOUNT)
+        if self.cfg.wall_penalty != 0.0:
+            if vzd.GameVariable.POSITION_X not in current: requested.append(vzd.GameVariable.POSITION_X)
+            if vzd.GameVariable.POSITION_Y not in current: requested.append(vzd.GameVariable.POSITION_Y)
         for var in requested: self.game.add_available_game_variable(var)
 
     def _find_var_index(self, target_var: vzd.GameVariable) -> int | None:
@@ -278,9 +308,12 @@ class VizDoomGymnasiumEnv(gym.Env):
         vars_ = state.game_variables
         if self.kill_idx is not None: self.prev_killcount = float(vars_[self.kill_idx])
         if self.ammo_idx is not None: self.prev_ammo = float(vars_[self.ammo_idx])
-        if self.progress_idx is not None: self.prev_posx = float(vars_[self.progress_idx])
+        if self.posx_idx is not None: self.prev_posx = float(vars_[self.posx_idx])
+        if self.posy_idx is not None: self.prev_pos_y = float(vars_[self.posy_idx])
         if self.health_idx is not None: self.prev_health = float(vars_[self.health_idx])
         if self.damage_idx is not None: self.prev_damage = float(vars_[self.damage_idx])
+        if self.posx_idx is not None: self.prev_pos_x = float(vars_[self.posx_idx])
+        if self.posy_idx is not None: self.prev_pos_y = float(vars_[self.posy_idx])
 
     def _shape_reward(self, base_reward: float, state: vzd.GameState | None, terminated: bool) -> float:
         shaped = base_reward
@@ -295,18 +328,29 @@ class VizDoomGymnasiumEnv(gym.Env):
             return shaped
 
         vars_ = state.game_variables
+        # Apply Rage Multiplier if active
+        current_multiplier = 1.0
+        if self.rage_steps > 0:
+            current_multiplier = self.cfg.pain_rage_multiplier
+            self.rage_steps -= 1
+            # Optional: Visualize rage? (Print debug if needed)
+            # if self.rage_steps % 10 == 0: print(f"RAGE ACTIVE: {self.rage_steps}")
+
         if self.kill_idx is not None:
             kc = float(vars_[self.kill_idx])
             delta = kc - self.prev_killcount
             if delta > 0:
-                shaped += self.cfg.kill_reward * delta
+                shaped += self.cfg.kill_reward * delta * current_multiplier
                 self.steps_since_kill = 0
             self.prev_killcount = kc
         
         if self.ammo_idx is not None:
             ammo = float(vars_[self.ammo_idx])
-            used = max(0.0, self.prev_ammo - ammo)
-            if used > 0: shaped -= self.cfg.ammo_penalty * used
+            delta_ammo = ammo - self.prev_ammo
+            if delta_ammo > 0:
+                if self.cfg.ammo_reward > 0: shaped += self.cfg.ammo_reward * delta_ammo
+            elif delta_ammo < 0:
+                if self.cfg.ammo_penalty > 0: shaped -= self.cfg.ammo_penalty * abs(delta_ammo)
             self.prev_ammo = ammo
 
         delta_x = 0.0
@@ -327,20 +371,41 @@ class VizDoomGymnasiumEnv(gym.Env):
             h = float(vars_[self.health_idx])
             if self.cfg.health_penalty != 0.0:
                 lost = self.prev_health - h
-                if lost > 0.0: shaped -= self.cfg.health_penalty * lost
+                if lost > 0.0: 
+                    shaped -= self.cfg.health_penalty * lost
+                    # TRIGGER RAGE
+                    if self.cfg.pain_rage_multiplier > 1.0:
+                        self.rage_steps = 70 # ~2 seconds of RAGE
             if self.cfg.health_delta_scale != 0.0:
                 delta_h = h - self.prev_health
-                if delta_h != 0.0: shaped += self.cfg.health_delta_scale * delta_h
+                if delta_h > 0.0: shaped += self.cfg.health_delta_scale * delta_h
             self.prev_health = h
 
         if self.damage_idx is not None and self.cfg.damage_reward != 0.0:
             d = float(vars_[self.damage_idx])
             delta_d = d - self.prev_damage
             if delta_d > 0.0: 
-                r_damage = -self.cfg.damage_reward * delta_d
-                shaped += r_damage
+                shaped += self.cfg.damage_reward * delta_d * current_multiplier
                 # print(f"[DEBUG] Damage Penalty: {r_damage} (Delta: {delta_d})")
             self.prev_damage = d
+
+        # Wall Humping Penalty
+        if self.cfg.wall_penalty > 0.0 and self.posx_idx is not None and self.posy_idx is not None:
+            curr_x = float(vars_[self.posx_idx])
+            curr_y = float(vars_[self.posy_idx])
+            # Check if action was a move action (Indices 1,7=Fwd; 4,8=ML; 5,9=MR)
+            # This relies on the specific action set order in _build_actions_by_scenario
+            is_move = self._last_action_idx in [1, 4, 5, 7, 8, 9] 
+            if is_move:
+                dist = np.sqrt((curr_x - self.prev_pos_x)**2 + (curr_y - self.prev_pos_y)**2)
+                if dist < 2.0: # Threshold for "stuck"
+                    shaped -= self.cfg.wall_penalty
+            
+            self.prev_pos_x = curr_x
+            self.prev_pos_y = curr_y
+
+        if (self.cfg.living_penalty > 0.0 and self.steps_since_kill >= self.cfg.kill_grace_steps and not terminated):
+            shaped -= self.cfg.living_penalty
 
         return shaped
 
@@ -353,13 +418,23 @@ class VizDoomGymnasiumEnv(gym.Env):
         processed = self._process_frame(frame)
         for i in range(self.cfg.frame_stack): self._frames[i] = processed
         self._update_game_vars(state)
-        if self.progress_idx is not None:
-            self.max_posx = self.prev_posx
+        self.prev_killcount = 0.0
+        self.prev_ammo = 0.0
+        self.prev_posx = 0.0
+        self.prev_health = 100.0
+        self.prev_damage = 0.0
+        self.prev_pos_x = 0.0
+        self.prev_pos_y = 0.0
+        self.max_posx = -99999.0
+        self.steps_since_kill = 0
+        self.rage_steps = 0 # Counter for Pain Rage
+        self._update_game_vars(self.game.get_state())
         return self._get_obs(), {}
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, dict]:
         # [CRITICAL] Ignore native WAD rewards (distance/shaping) to prevent "Exploding Reward".
         # We rely strictly on Python-side shaping (Kill, Progress, Damage).
+        self._last_action_idx = action # Store for shaping
         self.game.make_action(self._actions[action].tolist(), self.cfg.frame_skip)
         base_reward = 0.0 
         
@@ -516,6 +591,7 @@ def parse_args():
     # Rewards
     parser.add_argument("--kill-reward", type=float, default=None)
     parser.add_argument("--ammo-penalty", type=float, default=None)
+    parser.add_argument("--ammo-reward", type=float, default=None)
     parser.add_argument("--progress-scale", type=float, default=None)
     parser.add_argument("--health-penalty", type=float, default=None)
     parser.add_argument("--health-delta-scale", type=float, default=None)
@@ -525,8 +601,10 @@ def parse_args():
     parser.add_argument("--forward-penalty", type=float, default=None)
     parser.add_argument("--damage-reward", type=float, default=None)
     parser.add_argument("--completion-reward", type=float, default=None)
-    parser.add_argument("--visual-envs", type=int, nargs="+", default=[], help="List of env indices to show (e.g. 0 1)")
-    # PPO
+    parser.add_argument("--wall-penalty", type=float, default=None)
+    parser.add_argument("--pain-rage-multiplier", type=float, default=None)
+
+    # PPO args
     parser.add_argument("--learning-rate", type=float, default=2.5e-4)
     parser.add_argument("--anneal-lr", action="store_true")
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -534,25 +612,36 @@ def parse_args():
     parser.add_argument("--num-minibatches", type=int, default=4)
     parser.add_argument("--update-epochs", type=int, default=4)
     parser.add_argument("--norm-adv", action="store_true")
-    parser.add_argument("--clip-coef", type=float, default=0.1)
+    parser.add_argument("--clip-coef", type=float, default=0.2)
+    parser.add_argument("--clip-vloss", action="store_true")
     parser.add_argument("--ent-coef", type=float, default=0.01)
-    parser.add_argument("--ent-coef-warm", type=float, default=None)
-    parser.add_argument("--ent-warm-steps", type=int, default=0)
-    parser.add_argument("--ent-coef-final", type=float, default=None)
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--target-kl", type=float, default=None)
+
+    # Entropy schedule
+    parser.add_argument("--ent-coef-warm", type=float, default=None)
+    parser.add_argument("--ent-warm-steps", type=int, default=0)
+    parser.add_argument("--ent-coef-final", type=float, default=None)
+
     # Logging
     parser.add_argument("--track", action="store_true")
-    parser.add_argument("--tb-logdir", type=str, default="runs")
-    parser.add_argument("--exp-name", type=str, default="doom_ppo")
-    parser.add_argument("--save-interval", type=int, default=100_000)
+    parser.add_argument("--save-interval", type=int, default=100000)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--exp-name", type=str, default="doom_ppo")
+    parser.add_argument("--tb-logdir", type=str, default="runs")
+
     # System
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--torch-deterministic", action="store_true")
+
+    # Visual Debugging
+    parser.add_argument("--visual-envs", type=int, nargs="+", default=[], help="List of env indices to show (e.g. 0 1)")
+
+    # LSTM
     parser.add_argument("--use-lstm", action="store_true")
     parser.add_argument("--lstm-hidden-size", type=int, default=512)
+
     return parser.parse_args()
 
 
@@ -580,6 +669,7 @@ def main():
         scenario_cfg=args.scenario_cfg, scenario_name=scenario_name,
         use_combo_actions=args.use_combo_actions, use_shared_actions=args.use_shared_actions,
         frame_skip=args.frame_skip, kill_reward=args.kill_reward, ammo_penalty=args.ammo_penalty,
+        ammo_reward=args.ammo_reward,
         progress_scale=args.progress_scale, health_penalty=args.health_penalty,
         health_delta_scale=args.health_delta_scale, death_penalty=args.death_penalty,
         living_penalty=args.living_penalty, kill_grace_steps=args.kill_grace_steps,
@@ -648,6 +738,7 @@ def main():
         lstm_states_c = np.zeros_like(lstm_states_h)
 
     global_step = 0
+    last_save_step = global_step 
     start_time = time.time()
     next_obs, _ = envs.reset()
     next_done = np.zeros(args.num_envs, dtype=np.bool_)
@@ -879,7 +970,9 @@ def main():
             writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
             writer.add_histogram("charts/action_distribution", b_actions, global_step)
 
-        if global_step % args.save_interval == 0 or update == num_updates:
+        # Save if we passed the interval OR it's the last update
+        if global_step - last_save_step >= args.save_interval or update == num_updates:
+            last_save_step = global_step
             path = os.path.join(args.checkpoint_dir, f"{run_name}_step{global_step}.pt")
             torch.save({
                 "model_state_dict": agent.state_dict(),
