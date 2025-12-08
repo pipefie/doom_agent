@@ -10,28 +10,36 @@ class VizDoomGym(gym.Env):
         self.game = game
         self.game.init()
         
-        # MANTENEMOS LAS 12 ACCIONES para compatibilidad con la red neuronal del Nivel 3
-        # Aunque disparar no sirva de nada aquí, la red espera 12 salidas.
+        # El espacio de acciones que definiste
         self.actions = [
-            # --- Acciones Simples ---
-            [0,0,0], # 0: Idle
-            [1,0,0], # 1: Avanzar (Forward)
-            [0,1,0], # 2: Girar Izquierda
-            [0,0,1], # 3: Girar Derecha
-            
-            # --- Acciones Combinadas (CRÍTICAS para este nivel) ---
-            # Permiten correr y girar a la vez, o correr en diagonal.
-            
-            [1,1,0], # 4: Avanzar + Girar Izq (Curva rápida)
-            [1,0,1], # 5: Avanzar + Girar Der (Curva rápida)
-
+            # Tu lista de acciones...
+            [0,0,0,0,0,0,0], # 0: Idle
+            [1,0,0,0,0,0,0], # 1: Forward
+            [0,0,1,0,0,0,0], # 2: Turn Left
+            [0,0,0,1,0,0,0], # 3: Turn Right
+            [0,0,0,0,1,0,0], # 4: Strafe Left
+            [0,0,0,0,0,1,0], # 5: Strafe Right
+            [0,0,0,0,0,0,1], # 6: Attack
+            [1,0,0,0,0,0,1], # 7: Forward + Attack
+            [0,0,0,0,1,0,1], # 8: Strafe Left + Attack
+            [0,0,0,0,0,1,1], # 9: Strafe Right + Attack
+            [0,0,1,0,0,0,1], # 10: Turn Left + Attack
+            [0,0,0,1,0,0,1], # 11: Turn Right + Attack
         ]
         
         self.action_space = spaces.Discrete(len(self.actions))
         self.observation_space = spaces.Box(low=0, high=255, shape=(84, 84), dtype=np.uint8)
 
+        # --- Obtener índices de variables de juego ---
         self.health_idx = self._get_var_idx(vzd.GameVariable.HEALTH)
+        self.kills_idx = self._get_var_idx(vzd.GameVariable.FRAGCOUNT)
+        # AÑADIDO: Rastreador de armadura
+        self.armor_idx = self._get_var_idx(vzd.GameVariable.ARMOR)
+        
+        # --- Variables de estado previo ---
         self.prev_health = 100
+        self.prev_kills = 0
+        self.prev_armor = 0 # La armadura inicial suele ser 0
         self._update_prev_vars()
 
     def _get_var_idx(self, variable):
@@ -45,51 +53,76 @@ class VizDoomGym(gym.Env):
         return None
 
     def _update_prev_vars(self):
+        """Actualiza todas las variables de estado previas (vida, kills, armadura)."""
         state = self.game.get_state()
         if state:
             vars = state.game_variables
             if self.health_idx is not None: self.prev_health = vars[self.health_idx]
+            if self.kills_idx is not None: self.prev_kills = vars[self.kills_idx]
+            if self.armor_idx is not None: self.prev_armor = vars[self.armor_idx]
 
     def step(self, action_idx):
-            # Ejecutar acción (4 tics por frame es estándar)
-            self.game.make_action(self.actions[action_idx], 4)
+        # Ejecutar la acción en el juego
+        self.game.make_action(self.actions[action_idx], 4)
+        
+        state = self.game.get_state()
+        done = self.game.is_episode_finished()
+        
+        # --- NUEVO CÁLCULO DE RECOMPENSAS SEGÚN TUS ESPECIFICACIONES ---
+        reward = 0.0
+        
+        if state:
+            vars = state.game_variables
             
-            state = self.game.get_state()
-            done = self.game.is_episode_finished()
+            # 1. Recompensa por vivir
+            reward += 0.05
             
-            # --- CÁLCULO DE RECOMPENSA ---
-            reward = 0.0
+            # Obtener variables actuales
+            curr_health = vars[self.health_idx] if self.health_idx is not None else 0
+            curr_kills = vars[self.kills_idx] if self.kills_idx is not None else 0
+            curr_armor = vars[self.armor_idx] if self.armor_idx is not None else 0
             
-            if state:
-                # Variables actuales
-                vars = state.game_variables
-                curr_health = vars[self.health_idx] if self.health_idx is not None else 0
+            # 2. Recompensa/Penalización por cambio de vida
+            health_delta = curr_health - self.prev_health
+            if health_delta > 0:
+                reward += 10.0  # Curarse
+            elif health_delta < 0:
+                reward -= 1.0   # Recibir daño
+            
+            # 3. Recompensa por conseguir armadura
+            armor_delta = curr_armor - self.prev_armor
+            if armor_delta > 0:
+                reward += 5.0
+            
+            # 4. Recompensa por matar
+            kill_delta = curr_kills - self.prev_kills
+            if kill_delta > 0:
+                reward += 20.0 * kill_delta
+            
+            # 5. Penalización por disparar
+            # CORREGIDO: El botón de ataque es el de índice 6 en tu lista
+            if self.actions[action_idx][6] == 1:
+                reward -= 0.05
                 
-                # 1. Recompensa por vivir (incentivo base)
-                reward += 0.05 
-                
-                # 2. Diferencia de salud
-                health_delta = curr_health - self.prev_health
-                
-                if health_delta > 0:
-                    # ¡Recogió un Medkit! (+1.0 por cada kit aprox)
-                    reward += 1.0
-                # Actualizar previo
-                self.prev_health = curr_health
-                
-                # Procesar imagen
-                screen = cv2.resize(state.screen_buffer, (84, 84))
-                obs = screen
-            else:
-                obs = np.zeros((84, 84), dtype=np.uint8)
-                # Penalización extra por morir
-                reward -= 5.0 
+            # Actualizar variables para el próximo frame
+            self.prev_health = curr_health
+            self.prev_kills = curr_kills
+            self.prev_armor = curr_armor
+            
+            # Procesar la observación (pantalla del juego)
+            screen = cv2.resize(state.screen_buffer, (84, 84))
+            obs = screen
+        else:
+            # Si el estado es nulo (el agente murió)
+            obs = np.zeros(self.observation_space.shape, dtype=np.uint8)
+            # 6. Penalización por morir
+            reward -= 10.0
 
-            return obs, reward, done, False, {}
+        return obs, reward, done, False, {}
     
     def reset(self, seed=None, options=None):
         self.game.new_episode()
-        self._update_prev_vars()
+        self._update_prev_vars() # Actualiza los contadores al inicio
         state = self.game.get_state()
         if state:
             return cv2.resize(state.screen_buffer, (84, 84)), {}
