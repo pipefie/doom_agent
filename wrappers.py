@@ -33,12 +33,14 @@ class VizDoomGym(gym.Env):
         self.damage_idx = self._get_var_idx(vzd.GameVariable.DAMAGECOUNT)
         self.kill_idx = self._get_var_idx(vzd.GameVariable.KILLCOUNT)
         self.ammo_idx = self._get_var_idx(vzd.GameVariable.AMMO2)
+        self.health_idx = self._get_var_idx(vzd.GameVariable.HEALTH)
         
         # Inicializar previos
         self.prev_damage = 0
         self.prev_kill = 0
         self.prev_ammo = 0
-        
+        self.prev_health = 100
+
         # Resetear para llenar los previos correctamente
         self._update_prev_vars()
 
@@ -60,6 +62,7 @@ class VizDoomGym(gym.Env):
             if self.damage_idx is not None: self.prev_damage = vars[self.damage_idx]
             if self.kill_idx is not None: self.prev_kill = vars[self.kill_idx]
             if self.ammo_idx is not None: self.prev_ammo = vars[self.ammo_idx]
+            if self.health_idx is not None: self.prev_health = vars[self.health_idx]
 
     def step(self, action_idx):
         game_reward = self.game.make_action(self.actions[action_idx], 4)
@@ -67,7 +70,7 @@ class VizDoomGym(gym.Env):
         state = self.game.get_state()
         done = self.game.is_episode_finished()
         
-        reward = game_reward
+        reward = game_reward * 0.05
         
         if state:
             # Procesar imagen
@@ -81,7 +84,7 @@ class VizDoomGym(gym.Env):
             if self.damage_idx is not None:
                 curr_dmg = vars[self.damage_idx]
                 if curr_dmg > self.prev_damage:
-                    reward += (curr_dmg - self.prev_damage) * 0.05
+                    reward += (curr_dmg - self.prev_damage) * 0.01
                 self.prev_damage = curr_dmg
                 
             # 2. Enemigos matados
@@ -97,13 +100,24 @@ class VizDoomGym(gym.Env):
                 if curr_ammo < self.prev_ammo:
                     reward -= (self.prev_ammo - curr_ammo) * 0.01
                 self.prev_ammo = curr_ammo
+
+            if self.health_idx is not None:
+                curr_health = vars[self.health_idx]
+                if curr_health < self.prev_health:
+                    # -0.2 por cada punto de vida perdido
+                    reward -= (self.prev_health - curr_health) * 0.2
+                self.prev_health = curr_health
                 
         else:
             obs = np.zeros((84, 84), dtype=np.uint8)
         
         # Penalización por existir (para que se de prisa)
         if not done:
-            reward -= 0.01
+            reward -= 0.001
+
+        if done:
+            if self.prev_health <= 0: # O usa una lógica basada en el reward del juego
+                reward -= 10.0 # Castigo extra por fracasar muriendo
 
         return obs, reward, done, False, {}
 
