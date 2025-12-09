@@ -98,6 +98,25 @@
             1.  **Ammo Reward (`ammo_reward=0.05`):** Explicitly reward gaining ammo. Picking up a clip (10 bullets) is now worth 0.5 points.
             2.  **Health Reward (`health_delta_scale=0.05`):** Explicitly reward gaining health. Picking up a medkit (25hp) is now worth 1.25 points.
         - *Hypothesis:* By attaching immediate positive value to resource acquisition, we teach the agent that scavenging is a valid and profitable sub-objective, creating a loop of "Kill -> Scavenge -> Kill".
+    - **Phase 5.10:** "Robust Visualization" (Tooling).
+        - *Problem:* `GLX BadValue` errors prevented native window rendering in headless environments, blocking visual debugging.
+        - *Solution:* Implemented OpenCV-based visualization (`--visual-envs` arg). The main process grabs frames from the `SyncVectorEnv` and displays them using `cv2.imshow` and `cv2.waitKey`.
+    - **Phase 5.11:** "The Arms Dealer" (Economy Fix).
+        - *Problem:* Agent ignored non-bullet ammo and fought with bare hands.
+        - *Root Cause:* `kill_reward` (15.0) heavily outweighed `ammo_reward` (0.05).
+        - *Solution:* Rebalanced economy. Increased `ammo_reward` to 0.20 and decreased `kill_reward` to 10.0.
+    - **Phase 5.12:** "The Scavenger" (Universal Vision).
+        - *Problem:* Agent was "blind" to Shells, Rockets, and Cells because the config only exposed `AMMO2` (Bullets).
+        - *Solution:*
+            1.  **Universal Tracking:** Modified `VizDoomGymnasiumEnv` to track `AMMO2`, `AMMO3`, `AMMO4`, and `AMMO5` variables independently, summing their deltas for rewards.
+            2.  **Panic Penalty:** Added a constant penalty (`-0.05` per step) if the current weapon's ammo (`SELECTED_WEAPON_AMMO`) drops to 0.
+    - **Phase 5.13 (Current):** "The Matador" (Tactical Evasion).
+        - *Problem:* Agent displayed "temerary" (reckless) behavior, face-tanking damage to trade hits.
+        - *Root Cause:* `pain_rage_multiplier=2.0` acted as a "Berserker" mechanic, doubling rewards after taking damage. This made getting hit mathematically profitable.
+        - *Solution:*
+            1.  **Disable Rage:** Set `pain_rage_multiplier = 1.0` (Neutral).
+            2.  **Increase Pain:** Raised `health_penalty` to **0.5**. Taking damage is now strictly net-negative.
+        - *Hypothesis:* The agent will be forced to learn dodging/strafing behavior to preserve its score.
 
 ## Environment Setup (ViZDoom + Gymnasium + uv)
 - Dependencies are managed via `uv` (`pyproject.toml` + `uv.lock`). Run commands with `uv run python ...` to ensure the right environment.

@@ -49,6 +49,7 @@ class DoomConfig:
     pain_rage_multiplier: float = 1.0 # Multiplier for kill/damage rewards after taking damage
 
     visible: bool = False
+    cv2_show: bool = False # Use OpenCV to show game state directly (headless friendly)
 
 
 SCENARIO_CFG_MAP = {
@@ -110,19 +111,19 @@ SCENARIO_SHAPING_DEFAULTS = {
         "damage_reward": 0.0,
     },
     "deathmatch_simple": {
-        "kill_reward": 15.0,        # High reward for kills.
+        "kill_reward": 5.0,         # [Phase 5.12] Reduced to match Ammo parity.
         "ammo_penalty": 0.05,       # Moderate penalty.
         "progress_scale": 0.0,
-        "health_penalty": 0.1,      # Fear pain.
-        "health_delta_scale": 0.05, # NEW: Reward for healing (25hp = 1.25).
+        "health_penalty": 0.5,      # [Phase 5.13] The Matador: High penalty. 10 dmg = -5.0 pts.
+        "health_delta_scale": 0.05, # Reward for healing.
         "death_penalty": 25.0,      # Fear death.
         "living_penalty": 0.01,     # Low rent.
         "kill_grace_steps": 0,
         "forward_penalty": 0.0,
         "damage_reward": 2.0,       # Reward hitting.
         "wall_penalty": 0.5,        # Penalty for moving without going anywhere.
-        "pain_rage_multiplier": 3.0, # 3x Reward for violence after getting hurt.
-        "ammo_reward": 0.05,        # NEW: Reward for scavenging ammo (10 bullets = 0.5).
+        "pain_rage_multiplier": 1.0, # [Phase 5.13] Disabled. No bonus for getting hit.
+        "ammo_reward": 0.5,         # [Phase 5.12] Universal Ammo Reward. 1 Clip = +5.0 (Same as Kill).
     },
 }
 
@@ -166,6 +167,13 @@ class VizDoomGymnasiumEnv(gym.Env):
         self.screen_w = self.game.get_screen_width()
         self.screen_h = self.game.get_screen_height()
 
+        if self.cfg.cv2_show:
+            self.cv2_window_name = f"Doom_Env_{self.cfg.scenario_name}"
+            # Create window now to fail early if CV2 is broken, though unlikely
+            cv2.namedWindow(self.cv2_window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.cv2_window_name, 600, 450)
+            print(f"[INFO] CV2 Debug Window Enabled: {self.cv2_window_name}")
+
         if self.cfg.use_combo_actions:
             self._actions = self._build_actions_by_scenario()
             self.action_space = gym.spaces.Discrete(len(self._actions))
@@ -182,7 +190,15 @@ class VizDoomGymnasiumEnv(gym.Env):
 
         self.available_vars = self.game.get_available_game_variables()
         self.kill_idx = self._find_var_index(vzd.GameVariable.KILLCOUNT)
-        self.ammo_idx = self._find_var_index(vzd.GameVariable.AMMO2)
+        
+        # [Phase 5.12] Multi-Ammo Tracking
+        self.ammo_indices = {}
+        for ammo_var in [vzd.GameVariable.AMMO2, vzd.GameVariable.AMMO3, vzd.GameVariable.AMMO4, vzd.GameVariable.AMMO5]:
+            idx = self._find_var_index(ammo_var)
+            if idx is not None: self.ammo_indices[ammo_var] = idx
+
+        self.selected_weapon_ammo_idx = self._find_var_index(vzd.GameVariable.SELECTED_WEAPON_AMMO)
+        
         self.progress_idx = self._find_var_index(vzd.GameVariable.POSITION_X)
         self.health_idx = self._find_var_index(vzd.GameVariable.HEALTH)
         self.damage_idx = self._find_var_index(vzd.GameVariable.DAMAGECOUNT)
@@ -190,7 +206,7 @@ class VizDoomGymnasiumEnv(gym.Env):
         self.posy_idx = self._find_var_index(vzd.GameVariable.POSITION_Y)
 
         self.prev_killcount = 0.0
-        self.prev_ammo = 0.0
+        self.prev_ammo = {} # Dict for tracking individual ammo types
         self.prev_posx = 0.0
         self.prev_health = 0.0
         self.prev_damage = 0.0
@@ -204,8 +220,11 @@ class VizDoomGymnasiumEnv(gym.Env):
         requested = []
         if self.cfg.kill_reward != 0.0 and vzd.GameVariable.KILLCOUNT not in current:
             requested.append(vzd.GameVariable.KILLCOUNT)
-        if self.cfg.ammo_penalty != 0.0 and vzd.GameVariable.AMMO2 not in current:
-            requested.append(vzd.GameVariable.AMMO2)
+        
+        # [Phase 5.12] Request ALL Ammo Types + Selected Weapon Logic
+        if self.cfg.ammo_penalty != 0.0 or self.cfg.ammo_reward != 0.0:
+            for v in [vzd.GameVariable.AMMO2, vzd.GameVariable.AMMO3, vzd.GameVariable.AMMO4, vzd.GameVariable.AMMO5, vzd.GameVariable.SELECTED_WEAPON_AMMO]:
+                if v not in current: requested.append(v)
         if self.scenario_name == "deadly_corridor" or self.cfg.progress_scale != 0.0:
             if vzd.GameVariable.POSITION_X not in current: requested.append(vzd.GameVariable.POSITION_X)
         if self.cfg.health_penalty != 0.0 or self.scenario_name == "deadly_corridor":
@@ -307,7 +326,11 @@ class VizDoomGymnasiumEnv(gym.Env):
         if state is None: return
         vars_ = state.game_variables
         if self.kill_idx is not None: self.prev_killcount = float(vars_[self.kill_idx])
-        if self.ammo_idx is not None: self.prev_ammo = float(vars_[self.ammo_idx])
+        
+        # Update ALL ammo types
+        for var, idx in self.ammo_indices.items():
+            self.prev_ammo[var] = float(vars_[idx])
+
         if self.posx_idx is not None: self.prev_posx = float(vars_[self.posx_idx])
         if self.posy_idx is not None: self.prev_pos_y = float(vars_[self.posy_idx])
         if self.health_idx is not None: self.prev_health = float(vars_[self.health_idx])
@@ -344,14 +367,28 @@ class VizDoomGymnasiumEnv(gym.Env):
                 self.steps_since_kill = 0
             self.prev_killcount = kc
         
-        if self.ammo_idx is not None:
-            ammo = float(vars_[self.ammo_idx])
-            delta_ammo = ammo - self.prev_ammo
-            if delta_ammo > 0:
-                if self.cfg.ammo_reward > 0: shaped += self.cfg.ammo_reward * delta_ammo
-            elif delta_ammo < 0:
-                if self.cfg.ammo_penalty > 0: shaped -= self.cfg.ammo_penalty * abs(delta_ammo)
-            self.prev_ammo = ammo
+        # [Phase 5.12] Panic Penalty (using SELECTED_WEAPON_AMMO)
+        if self.selected_weapon_ammo_idx is not None:
+            current_ammo = float(vars_[self.selected_weapon_ammo_idx])
+            if current_ammo <= 0.0:
+                shaped -= 0.05
+
+        # [Phase 5.12] Universal Ammo Reward (Summing deltas of independent ammo types)
+        # This handles Pistol/Shotgun/Rocket/Plasma separately preventing swap penalties.
+        for var, idx in self.ammo_indices.items():
+            val = float(vars_[idx])
+            try:
+                prev = self.prev_ammo.get(var, 0.0) # Graceful fallback for first step
+                delta = val - prev
+                if delta > 0:
+                     if self.cfg.ammo_reward > 0: shaped += self.cfg.ammo_reward * delta
+                elif delta < 0:
+                     # Penalize firing logic? Or just ignore? 
+                     # If we penalize, shooting becomes painful.
+                     if self.cfg.ammo_penalty > 0: shaped -= self.cfg.ammo_penalty * abs(delta)
+                self.prev_ammo[var] = val
+            except KeyError:
+                 self.prev_ammo[var] = val # First frame init
 
         delta_x = 0.0
         if self.progress_idx is not None and self.cfg.progress_scale != 0.0:
@@ -419,7 +456,7 @@ class VizDoomGymnasiumEnv(gym.Env):
         for i in range(self.cfg.frame_stack): self._frames[i] = processed
         self._update_game_vars(state)
         self.prev_killcount = 0.0
-        self.prev_ammo = 0.0
+        self.prev_ammo = {} # Fix: Reset to dict for Multi-Ammo
         self.prev_posx = 0.0
         self.prev_health = 100.0
         self.prev_damage = 0.0
@@ -454,6 +491,24 @@ class VizDoomGymnasiumEnv(gym.Env):
             obs = self._get_obs()
             info = {}
 
+            if self.cfg.cv2_show:
+                # Get the latest frame (CHW)
+                img = obs[-1] # Shape (H, W) or (3, H, W)
+                # Convert to BGR for display
+                # If Grayscale (2D): Scale to 0-255
+                if img.ndim == 2:
+                    disp = (img * 255).astype(np.uint8)
+                else: 
+                    # If Color (3, H, W): Transpose to (H, W, 3) BGR
+                    # Note: We assumed RGB in wrapper, but CV2 wants BGR. 
+                    # Actually NatureCNN wrapper might have grayscale=True.
+                    # Let's handle generic float [0,1] -> uint8 [0,255]
+                    disp = (np.transpose(img, (1, 2, 0)) * 255).astype(np.uint8)
+                    disp = cv2.cvtColor(disp, cv2.COLOR_RGB2BGR)
+                
+                cv2.imshow(self.cv2_window_name, disp)
+                cv2.waitKey(1)
+
         reward = self._shape_reward(float(base_reward), state, terminated)
         if (self.cfg.living_penalty > 0.0 and self.steps_since_kill >= self.cfg.kill_grace_steps and not terminated):
             reward -= self.cfg.living_penalty
@@ -477,11 +532,16 @@ class VizDoomGymnasiumEnv(gym.Env):
 # 3. Env factory (vectorized)
 # =========================
 
-def make_vizdoom_env(base_cfg: DoomConfig, seed: int, idx: int, run_name: str, visual_envs: list):
+def make_vizdoom_env(base_cfg: DoomConfig, seed: int, idx: int, run_name: str, visual_envs: list, visual_debug: bool = False):
     def thunk():
         env_cfg = DoomConfig(**asdict(base_cfg))
         if idx in visual_envs:
             env_cfg.visible = True
+        
+        # If visual-debug is ON, enable cv2_show for Env 0 only (to avoid 8 windows popping up)
+        if visual_debug and idx == 0:
+            env_cfg.cv2_show = True
+
         render_mode = "rgb_array" if idx == 0 else None
         env = VizDoomGymnasiumEnv(env_cfg, render_mode=render_mode)
         # Note: We REMOVED RecordEpisodeStatistics here to use manual tracking
@@ -501,7 +561,7 @@ def make_vizdoom_env(base_cfg: DoomConfig, seed: int, idx: int, run_name: str, v
 
 def make_envs(args, doom_cfg: DoomConfig, run_name: str):
     return gym.vector.SyncVectorEnv(
-        [make_vizdoom_env(doom_cfg, args.seed, i, run_name, args.visual_envs) for i in range(args.num_envs)]
+        [make_vizdoom_env(doom_cfg, args.seed, i, run_name, args.visual_envs, args.visual_debug) for i in range(args.num_envs)]
     )
 
 
@@ -637,6 +697,7 @@ def parse_args():
 
     # Visual Debugging
     parser.add_argument("--visual-envs", type=int, nargs="+", default=[], help="List of env indices to show (e.g. 0 1)")
+    parser.add_argument("--visual-debug", action="store_true", help="Use OpenCV to show game state (headless compatible)")
 
     # LSTM
     parser.add_argument("--use-lstm", action="store_true")
