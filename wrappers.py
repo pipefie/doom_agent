@@ -10,9 +10,7 @@ class VizDoomGym(gym.Env):
         self.game = game
         self.game.init()
         
-        # El espacio de acciones que definiste
         self.actions = [
-            # Tu lista de acciones...
             [0,0,0,0,0,0,0], # 0: Idle
             [1,0,0,0,0,0,0], # 1: Forward
             [0,0,1,0,0,0,0], # 2: Turn Left
@@ -30,16 +28,13 @@ class VizDoomGym(gym.Env):
         self.action_space = spaces.Discrete(len(self.actions))
         self.observation_space = spaces.Box(low=0, high=255, shape=(84, 84), dtype=np.uint8)
 
-        # --- Obtener índices de variables de juego ---
         self.health_idx = self._get_var_idx(vzd.GameVariable.HEALTH)
         self.kills_idx = self._get_var_idx(vzd.GameVariable.FRAGCOUNT)
-        # AÑADIDO: Rastreador de armadura
-        self.armor_idx = self._get_var_idx(vzd.GameVariable.ARMOR)
+        self.ammo_idx = self._get_var_idx(vzd.GameVariable.SELECTED_WEAPON_AMMO)
         
-        # --- Variables de estado previo ---
         self.prev_health = 100
         self.prev_kills = 0
-        self.prev_armor = 0 # La armadura inicial suele ser 0
+        self.prev_ammo = 0
         self._update_prev_vars()
 
     def _get_var_idx(self, variable):
@@ -52,78 +47,71 @@ class VizDoomGym(gym.Env):
             pass
         return None
 
+    def _get_player_data(self, var):
+        if isinstance(var, np.ndarray):
+            return int(var.item(0))
+        else:
+            return int(var)
+
     def _update_prev_vars(self):
-        """Actualiza todas las variables de estado previas (vida, kills, armadura)."""
         state = self.game.get_state()
         if state:
             vars = state.game_variables
-            if self.health_idx is not None: self.prev_health = vars[self.health_idx]
-            if self.kills_idx is not None: self.prev_kills = vars[self.kills_idx]
-            if self.armor_idx is not None: self.prev_armor = vars[self.armor_idx]
+            if self.health_idx is not None: self.prev_health = self._get_player_data(vars[self.health_idx])
+            if self.kills_idx is not None: self.prev_kills = self._get_player_data(vars[self.kills_idx])
+            if self.ammo_idx is not None: self.prev_ammo = self._get_player_data(vars[self.ammo_idx])
 
     def step(self, action_idx):
-        # Ejecutar la acción en el juego
         self.game.make_action(self.actions[action_idx], 4)
-        
         state = self.game.get_state()
         done = self.game.is_episode_finished()
         
-        # --- NUEVO CÁLCULO DE RECOMPENSAS SEGÚN TUS ESPECIFICACIONES ---
         reward = 0.0
         
         if state:
             vars = state.game_variables
             
-            # 1. Recompensa por vivir
-            reward += 0.05
-            
-            # Obtener variables actuales
-            curr_health = vars[self.health_idx] if self.health_idx is not None else 0
-            curr_kills = vars[self.kills_idx] if self.kills_idx is not None else 0
-            curr_armor = vars[self.armor_idx] if self.armor_idx is not None else 0
-            
-            # 2. Recompensa/Penalización por cambio de vida
-            health_delta = curr_health - self.prev_health
-            if health_delta > 0:
-                reward += 10.0  # Curarse
-            elif health_delta < 0:
-                reward -= 1.0   # Recibir daño
-            
-            # 3. Recompensa por conseguir armadura
-            armor_delta = curr_armor - self.prev_armor
-            if armor_delta > 0:
-                reward += 5.0
-            
-            # 4. Recompensa por matar
+            curr_health = self._get_player_data(vars[self.health_idx])
+            curr_kills = self._get_player_data(vars[self.kills_idx])
+            curr_ammo = self._get_player_data(vars[self.ammo_idx])
+
+            # CÁLCULO DE RECOMPENSAS BASADO EN PAPERS
             kill_delta = curr_kills - self.prev_kills
-            if kill_delta > 0:
-                reward += 20.0 * kill_delta
+            health_delta = curr_health - self.prev_health
+            ammo_delta = curr_ammo - self.prev_ammo
+
+            reward_kill = kill_delta * 100
+            reward_health = health_delta * 1.0
+            reward_ammo = ammo_delta * 0.1
+            reward_living = 0.01
+
+            reward = reward_kill + reward_health + reward_ammo + reward_living
             
-            # 5. Penalización por disparar
-            # CORREGIDO: El botón de ataque es el de índice 6 en tu lista
-            if self.actions[action_idx][6] == 1:
-                reward -= 0.05
-                
-            # Actualizar variables para el próximo frame
+            # Penalización extra al morir para que sea una señal fuerte de fracaso
+            if done and curr_health <= 0:
+                reward -= 100
+
+            # Actualizar variables
             self.prev_health = curr_health
             self.prev_kills = curr_kills
-            self.prev_armor = curr_armor
+            self.prev_ammo = curr_ammo
             
-            # Procesar la observación (pantalla del juego)
-            screen = cv2.resize(state.screen_buffer, (84, 84))
-            obs = screen
+            obs = cv2.resize(state.screen_buffer, (84, 84))
         else:
-            # Si el estado es nulo (el agente murió)
             obs = np.zeros(self.observation_space.shape, dtype=np.uint8)
-            # 6. Penalización por morir
-            reward -= 10.0
+            # No hay información de estado, no se da recompensa ni castigo
+            reward = 0
 
         return obs, reward, done, False, {}
     
     def reset(self, seed=None, options=None):
         self.game.new_episode()
-        self._update_prev_vars() # Actualiza los contadores al inicio
+        self._update_prev_vars()
         state = self.game.get_state()
+        
         if state:
-            return cv2.resize(state.screen_buffer, (84, 84)), {}
-        return np.zeros((84, 84), dtype=np.uint8), {}
+            obs = cv2.resize(state.screen_buffer, (84, 84))
+            return obs, {}
+        else:
+            obs = np.zeros(self.observation_space.shape, dtype=np.uint8)
+            return obs, {}
