@@ -87,7 +87,7 @@ class VizDoomGym(gym.Env):
 
             reward_kill = kill_delta * 100
             reward_health = health_delta * 1.0
-            reward_ammo = ammo_delta * 0.05 # Recompensa por munición (baja)
+            reward_ammo = ammo_delta * 0.1
             
             # --- AÑADIDO ---
             # Recompensa por armadura (media). Un peso de 0.5 es un buen equilibrio.
