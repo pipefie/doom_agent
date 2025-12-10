@@ -31,10 +31,12 @@ class VizDoomGym(gym.Env):
         self.health_idx = self._get_var_idx(vzd.GameVariable.HEALTH)
         self.kills_idx = self._get_var_idx(vzd.GameVariable.FRAGCOUNT)
         self.ammo_idx = self._get_var_idx(vzd.GameVariable.SELECTED_WEAPON_AMMO)
+        self.armor_idx = self._get_var_idx(vzd.GameVariable.ARMOR)
         
         self.prev_health = 100
         self.prev_kills = 0
         self.prev_ammo = 0
+        self.prev_armor = 0
         self._update_prev_vars()
 
     def _get_var_idx(self, variable):
@@ -60,6 +62,7 @@ class VizDoomGym(gym.Env):
             if self.health_idx is not None: self.prev_health = self._get_player_data(vars[self.health_idx])
             if self.kills_idx is not None: self.prev_kills = self._get_player_data(vars[self.kills_idx])
             if self.ammo_idx is not None: self.prev_ammo = self._get_player_data(vars[self.ammo_idx])
+            if self.armor_idx is not None: self.prev_armor = self._get_player_data(vars[self.armor_idx])
 
     def step(self, action_idx):
         self.game.make_action(self.actions[action_idx], 4)
@@ -74,20 +77,27 @@ class VizDoomGym(gym.Env):
             curr_health = self._get_player_data(vars[self.health_idx])
             curr_kills = self._get_player_data(vars[self.kills_idx])
             curr_ammo = self._get_player_data(vars[self.ammo_idx])
+            curr_armor = self._get_player_data(vars[self.armor_idx])
 
-            # CÁLCULO DE RECOMPENSAS BASADO EN PAPERS
+            # --- CÁLCULO DE RECOMPENSAS BASADO EN PAPERS ---
             kill_delta = curr_kills - self.prev_kills
             health_delta = curr_health - self.prev_health
             ammo_delta = curr_ammo - self.prev_ammo
+            armor_delta = curr_armor - self.prev_armor
 
             reward_kill = kill_delta * 100
             reward_health = health_delta * 1.0
-            reward_ammo = ammo_delta * 0.1
+            reward_ammo = ammo_delta * 0.05 # Recompensa por munición (baja)
+            
+            # --- AÑADIDO ---
+            # Recompensa por armadura (media). Un peso de 0.5 es un buen equilibrio.
+            # Es más valiosa que la munición, pero menos que la vida o un kill.
+            reward_armor = armor_delta * 0.5
+            
             reward_living = 0.01
 
-            reward = reward_kill + reward_health + reward_ammo + reward_living
+            reward = reward_kill + reward_health + reward_ammo + reward_armor + reward_living
             
-            # Penalización extra al morir para que sea una señal fuerte de fracaso
             if done and curr_health <= 0:
                 reward -= 100
 
@@ -95,11 +105,11 @@ class VizDoomGym(gym.Env):
             self.prev_health = curr_health
             self.prev_kills = curr_kills
             self.prev_ammo = curr_ammo
+            self.prev_armor = curr_armor
             
             obs = cv2.resize(state.screen_buffer, (84, 84))
         else:
             obs = np.zeros(self.observation_space.shape, dtype=np.uint8)
-            # No hay información de estado, no se da recompensa ni castigo
             reward = 0
 
         return obs, reward, done, False, {}
