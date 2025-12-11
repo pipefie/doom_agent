@@ -494,3 +494,72 @@ This log details the step-by-step process of diagnosing and fixing a common rein
 ## command use to run succesfully the basic training
 
 uv run python doom_ppo_deadly_corridor.py   --scenario-name basic   --exp-name basic_phase1_clean  --use-combo-actions   --use-lstm --lstm-hidden-size 512   --frame-skip 4   --num-envs 8 --num-steps 128 --num-minibatches 4   --total-timesteps 1500000 --learning-rate 2.5e-4  --ent-coef 0.015   --vf-coef 0.5   --norm-adv   --anneal-lr   --cuda   --track
+
+
+
+## Evaluation Cheat Sheet
+Use these commands to demonstrate the agent's progression through the curriculum. All commands include --sleep-per-step 0.05 for human-friendly viewing speeds.
+
+### Phase 1: Basic (The Foundation)
+Goal: Verify the agent can move and shoot. (Checkpoint fixed)
+
+uv run python eval_doom_agent.py \
+    --checkpoint checkpoints/basic_phase1_clean_basic_lstm_2025-12-04_14-10-21_seed42_step1499136.pt \
+    --scenario-name basic \
+    --use-lstm --lstm-hidden-size 512 \
+    --episodes 5 --render --cuda \
+    --sleep-per-step 0.05 --damage-reward 1.0
+
+### Phase 2: Defend the Center
+Goal: Check 360-degree aiming and turret behavior.
+
+uv run python eval_doom_agent.py \
+    --checkpoint checkpoints/defend_center_phase2_defend_the_center_lstm_2025-12-04_16-21-49_seed42_step1999872.pt \
+    --scenario-name defend_the_center \
+    --use-lstm --lstm-hidden-size 512 \
+    --episodes 5 --render --cuda \
+    --sleep-per-step 0.05
+
+### Phase 3: Deadly Corridor
+Goal: Survive the corridor and reach the vest.
+
+uv run python eval_doom_agent.py \
+    --checkpoint checkpoints/deadly_corridor_phase3_deadly_corridor_lstm_2025-12-04_23-06-15_seed42_step4999168.pt \
+    --scenario-name deadly_corridor \
+    --use-lstm --lstm-hidden-size 512 \
+    --episodes 5 --render --cuda \
+    --sleep-per-step 0.05
+
+### Phase 4: Health Gathering Supreme
+Goal: Verify navigation and healing logic (no shooting).
+
+uv run python eval_doom_agent.py \
+    --checkpoint checkpoints/health_gathering_phase4_health_gathering_supreme_lstm_2025-12-05_11-54-11_seed42_step999424.pt \
+    --scenario-cfg configs/health_gathering_supreme.cfg \
+    --use-lstm --lstm-hidden-size 512 \
+    --episodes 3 --render --cuda \
+    --sleep-per-step 0.05
+
+### Phase 5.12: "The Scavenger" (Ammo Aware)
+Goal: Show the agent picking up different ammo types and managing panic. Note: This checkpoint tracks AMMO2/3/4/5 and has a Panic Penalty.
+
+uv run python eval_doom_agent.py \
+    --checkpoint checkpoints/deathmatch_phase5_scavenger_fixed_deathmatch_simple_lstm_2025-12-09_00-08-11_seed42_step9999360.pt \
+    --scenario-cfg configs/deathmatch_simple.cfg \
+    --use-lstm --lstm-hidden-size 512 \
+    --ammo-reward 0.5 \
+    --kill-reward 5.0 \
+    --episodes 3 --render --cuda \
+    --sleep-per-step 0.05
+
+### Phase 5.13: "The Matador" (Current Best)
+Goal: Demonstrate evasion. The agent should NOT Rage-face-tank but instead strafe/dodge. Note: Rage disabled, Pain is high.
+
+uv run python eval_doom_agent.py \
+    --checkpoint checkpoints/deathmatch_phase5_matador_deathmatch_simple_lstm_2025-12-09_12-31-04_seed42_step9999360.pt \
+    --scenario-cfg configs/deathmatch_simple.cfg \
+    --use-lstm --lstm-hidden-size 512 \
+    --health-penalty 0.5 \
+    --pain-rage-multiplier 1.0 \
+    --episodes 5 --render --cuda \
+    --sleep-per-step 0.05

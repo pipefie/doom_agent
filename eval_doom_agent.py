@@ -24,6 +24,7 @@ Usage example:
 import argparse
 import os
 import time
+import cv2
 from typing import Optional
 
 import numpy as np
@@ -195,6 +196,18 @@ def parse_args():
         default=None,
         help="Reward per point of DAMAGECOUNT (damage inflicted)",
     )
+    parser.add_argument(
+        "--ammo-reward",
+        type=float,
+        default=None,
+        help="Reward for picking up ammo (Phase 5.12)",
+    )
+    parser.add_argument(
+        "--pain-rage-multiplier",
+        type=float,
+        default=None,
+        help="Multiplier for rewards after taking damage (Phase 5.13)",
+    )
 
     return parser.parse_args()
 
@@ -226,6 +239,8 @@ def build_eval_config(args) -> DoomConfig:
     kill_grace_steps = defaults.get("kill_grace_steps", 0) if args.kill_grace_steps is None else args.kill_grace_steps
     forward_penalty = defaults.get("forward_penalty", 0.0) if args.forward_penalty is None else args.forward_penalty
     damage_reward = defaults["damage_reward"] if args.damage_reward is None else args.damage_reward
+    ammo_reward = defaults.get("ammo_reward", 0.0) if args.ammo_reward is None else args.ammo_reward
+    pain_rage_multiplier = defaults.get("pain_rage_multiplier", 1.0) if args.pain_rage_multiplier is None else args.pain_rage_multiplier
 
     return DoomConfig(
         scenario_cfg=args.scenario_cfg,
@@ -242,6 +257,8 @@ def build_eval_config(args) -> DoomConfig:
         kill_grace_steps=kill_grace_steps,
         forward_penalty=forward_penalty,
         damage_reward=damage_reward,
+        ammo_reward=ammo_reward,
+        pain_rage_multiplier=pain_rage_multiplier,
     )
 
 
@@ -394,6 +411,22 @@ def main():
 
             if args.sleep_per_step > 0.0:
                 time.sleep(args.sleep_per_step)
+
+            if args.render:
+                # Custom HD Rendering Logic (Bypasses Env's internal 84x84 grayscale viewer)
+                game = env.game 
+                state = game.get_state()
+                if state is not None:
+                    disp = state.screen_buffer
+                    if disp is not None:
+                        # Convert to BGR for OpenCV
+                        if disp.ndim == 3:
+                            if disp.shape[0] == 3: # CHW -> HWC
+                                disp = np.transpose(disp, (1, 2, 0))
+                            disp = cv2.cvtColor(disp, cv2.COLOR_RGB2BGR)
+                        
+                        cv2.imshow("Doom HD Evaluation", disp)
+                        cv2.waitKey(1)
 
             # Optional: print every N steps if you want to see live reward
             # if step_count % 20 == 0:
