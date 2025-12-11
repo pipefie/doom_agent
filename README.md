@@ -218,6 +218,22 @@ Our agent is not just one network; it is two distinct "brains" sharing a single 
     *   If $A > 0$ (result was better than expected), the Actor is encouraged to do it again.
     *   If $A < 0$ (result was worse/disappointing), the Actor is discouraged.
 
+### C. The Temporal Stack: Skipping vs. Stacking
+*   **The User Question:** "We skip 4 frames, but stack 4 frames. Does skipping delete the frames we need?"
+*   **The Answer:** No. Skipping drops the *intermediate* frames to extend our memory horizon.
+    *   **Without Skip:** Stack = $[t, t-1, t-2, t-3]$. (History: 0.1 sec). Agent sees smooth motion but has no memory of the past.
+    *   **With Skip (4):** Stack = $[t, t-4, t-8, t-12]$. (History: 0.4 sec).
+*   **Visualizing the Timeline:**
+    ```text
+    Tick 1: Rendered -> Stored in Stack[0]
+    Tick 2: Skipped (Physics runs, but Agent ignores it)
+    Tick 3: Skipped (Physics runs, but Agent ignores it)
+    Tick 4: Skipped (Physics runs, but Agent ignores it)
+    Tick 5: Rendered -> Stored in Stack[1]
+    ...
+    ```
+*   **Why this is good:** By ignoring the intermediate frames, the agent's memory spans a much longer period of time, allowing it to understand complex movements (like an enemy circling around) without needing a massive neural network.
+
 ---
 
 ## 6. Usage Guide

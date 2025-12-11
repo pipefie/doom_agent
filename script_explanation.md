@@ -154,6 +154,33 @@ c = c * (1.0 - done)
     - If we didn't mask, the LSTM would carry the memory of "dying in the corridor" (Episode 1) into the "start of the new run" (Episode 2). This would horribly confuse the agent ("Why am I scared? I just started").
     - **The Mask zeroes out the memory** instantly when an episode terminates, forcing the LSTM to start fresh for the new episode.
 
+### 5.3 Tensor Permutations: The Dimension Shuffle (New)
+
+The user asked about these lines:
+```python
+lstm_states_h[step] = next_lstm_state[0].permute(1, 0, 2).cpu().numpy()
+lstm_states_c[step] = next_lstm_state[1].permute(1, 0, 2).cpu().numpy()
+```
+
+#### The Mismatch
+There are **two different** conventions for array dimensions at play here:
+1.  **PyTorch LSTM Convention**: `(Num_Layers, Batch_Size, Hidden_Size)`.
+    - This is how `next_lstm_state` (the raw output from `self.lstm`) is formatted.
+    - In our case: `(1, 8, 512)` -> 1 Layer, 8 Envs, 512 Hidden Unit.
+2.  **Storage Buffer Convention**: `(Batch_Size, Num_Layers, Hidden_Size)`.
+    - This is how we initialized our storage arrays `lstm_states_h` (Line 798 of original script) to be consistent with other buffers like `obs` and `rewards`.
+    - In our case: `(8, 1, 512)`.
+
+#### The Fix: `.permute(1, 0, 2)`
+We need to swap the first and second dimensions to make the tensor fit into the storage slot.
+-   **Input**: `(0: Layers, 1: Batch, 2: Hidden)`
+-   **Permute(1, 0, 2)**: Reorders axes to -> `(1: Batch, 0: Layers, 2: Hidden)`.
+-   **Result**: The tensor shape flips from `(1, 8, 512)` to `(8, 1, 512)`, which perfectly matches `lstm_states_h[step]`.
+
+#### The Transfer: `.cpu().numpy()`
+-   **`cpu()`**: The tensor is currently on the GPU (CUDA). We cannot store it in a NumPy array (which lives in System RAM) directly. We must first copy it to the CPU.
+-   **`numpy()`**: Converts the PyTorch Tensor into a standard NumPy array for efficient storage in our rollout buffer.
+
 ## 6. Part 3: Deep Dive into PPO Implementation
 
 This section details exactly **where** and **how** the PPO (Proximal Policy Optimization) logic is implemented, identifying the Actor, Critic, and Core Algorithm.
@@ -178,17 +205,72 @@ In this implementation, the **Actor** and **Critic** share a common visual "back
     - **Purpose**: "The Evaluator". It takes the *exact same* hidden state $h_t$ and outputs a **Scalar Value** ($V(s)$). This predicts "How much total discounted reward do I expect to get from here until the end of the episode?".
     - **Why High Std (1.0)?**: The critic needs to output potentially large values (Returns like 20.0 or 50.0). A standard initialization enables it to reach these magnitudes faster.
 
-### 6.2 The "Core": Forward Pass (`get_action_and_value`)
+### 6.2 The "Core": Forward Pass (`get_action_and_value`) - Detailed Walkthrough
 
-The method `get_action_and_value` (Line 616) is the **Interface** where PPO happens during interaction.
+The method `get_action_and_value` (Line 616) is the **Interface** where the neural network processes observations. It handles both **Inference** (choosing an action) and **Training** (evaluating an action).
 
-1.  **Forward Pass**: `features = self.features(x)` -> `lstm_out = self.lstm(features)`.
-2.  **Actor Output**: `logits = self.actor(features)`.
-3.  **Critic Output**: `value = self.critic(features)`.
-4.  **Sampling (Stochasticity)**:
-    - We interpret `logits` as a `Categorical` distribution (Line 630).
-    - We sample `action = dist.sample()`. This is why the agent explores; it doesn't just pick the max logic, it rolls the dice based on probability.
-5.  **Returns**: `action` (what to do), `log_prob` (how confident we were), `entropy` (how random we were), `value` (our prediction).
+```python
+def get_action_and_value(self, x, lstm_state=None, done=None, action=None, deterministic=False):
+```
+
+#### 1. Visual Encoding (The Eyes)
+```python
+batch_size = x.shape[0]
+features = self.features(x)
+```
+-   **Input `x`**: A batch of stacked frames. Shape: `(Batch_Size, 4, 84, 84)`.
+-   **Output `features`**: The CNN flattens the image into a dense vector. Shape: `(Batch_Size, 512)`.
+-   **Why**: This condenses the raw pixels into a semantic representation (e.g., "Wall on left, Enemy in center").
+
+#### 2. Recurrent Memory (The Brain) - *If LSTM is enabled*
+```python
+if self.use_lstm:
+    if lstm_state is None: lstm_state = self.get_initial_state(...)
+    if done is None: done = torch.zeros(...)
+    
+    # LSTM Masking (CRITICAL)
+    done = done.view(1, batch_size, 1) # Reshape for broadcasting
+    h, c = lstm_state
+    h = h * (1.0 - done)
+    c = c * (1.0 - done)
+    
+    # LSTM Forward Pass
+    lstm_out, new_state = self.lstm(features.unsqueeze(0), (h, c))
+    features = lstm_out.squeeze(0)
+```
+-   **Masking**: We multiply `h` and `c` by `(1 - done)`. If `done=1` (episode finished), the memory is multiplied by 0. This "wipes" the memory for that specific environment in the batch so the next episode starts fresh.
+-   **Dimensions**: PyTorch LSTMs expect 3D inputs: `(Sequence_Length, Batch_Size, Input_Size)`.
+    -   We use `unsqueeze(0)` to add a fake sequence dimension of 1. Shape becomes `(1, Batch, 512)`.
+    -   We pass it through the LSTM.
+    -   We `squeeze(0)` the output to get back to `(Batch, 512)` for the linear layers.
+
+#### 3. Actor Head (The Decision)
+```python
+logits = self.actor(features)
+dist = Categorical(logits=logits)
+```
+-   **Logits**: The network outputs 12 unnormalized scores (one for each action). High score = better action.
+-   **Distribution**: We convert logits into a Probability Distribution.
+    -   Example: `[0.1, 2.5, 0.1, ...]`. Action 1 (2.5) has the highest probability.
+
+#### 4. Action Selection & Evaluation
+```python
+if action is None: 
+    action = dist.sample() if not deterministic else torch.argmax(logits, dim=-1)
+```
+-   **Inference (Rollout)**: `action` is typically `None`. We call `dist.sample()`. This picks an action randomly based on the probabilities.
+    -   **Why Sample?**: Exploration. If we always picked the best action, we'd never find new strategies.
+-   **Training (Update)**: When updating PPO, we pass in the *old* `action` that we took yesterday. We don't sample again; we want to know the probability of *that specific old action* under the *new* network.
+
+#### 5. Critic Head (The Valuation)
+```python
+return action, dist.log_prob(action), dist.entropy(), self.critic(features), new_state
+```
+-   **`action`**: The integer index chosen (e.g., 7).
+-   **`log_prob(action)`**: The log-probability of choosing that action. Used for the Policy Gradient loss.
+-   **`entropy()`**: Measure of uncertainty. Used for the Entropy Bonus (to encourage exploration).
+-   **`critic(features)`**: The scalar Value estimate $V(s)$. Used to calculate Advantage.
+-   **`new_state`**: The updated `(h, c)` to be passed to the next step.
 
 ### 6.3 Usage: The Training Loop
 
@@ -199,12 +281,38 @@ For `num_steps` (128 steps), the agent interacts with the environment (Lines 833
 - Crucially, we store **Obs, Actions, LogProbs, Rewards, Dones, and Values** in massive arrays `(num_steps, num_envs)`.
 - This creates the "Dataset" for the next PPO update. Unlike Q-Learning, PPO throws this dataset away after every update (On-Policy).
 
+#### Step 1.5: The Bootstrap (Handling the Unknown Future)
+**User Question**: "i dont get the bootstrap either"
+
+After we finish collecting 128 steps, the game usually *isn't over*. The agent is still alive.
+-   **Problem**: To calculate the "Return" (Total Future Reward), we need to know what happens *after* step 128. But we stopped playing!
+-   **Solution (Bootstrapping)**: We ask the **Critic** to *predict* the rest of the game.
+    ```python
+    with torch.no_grad():
+        next_value = agent.get_value(next_obs, next_lstm_state, next_done).reshape(1, -1)
+    ```
+-   **Explanation**:
+    -   `next_value`: Maximizes our best guess of all future rewards starting from step 129.
+    -   If `next_done` is True (Game Over), `next_value` is 0 (No future reward).
+    -   This allows us to treat the "Cutoff" point as if it were the end of the episode, using the Critic's prediction as the "Final Reward".
+
 #### Step 2: GAE (Generalized Advantage Estimation)
 Before updating, we need to know **how good** each action actually was compared to expectations. This is the **Advantage** ($A_t$).
 - **Calculated at Lines 887-898**.
 - **The Formula**: $A_t = \delta_t + (\gamma \lambda) A_{t+1}$
 - **Meaning**: If $A_t > 0$, the action was *better* than expected. If $A_t < 0$, it was worse.
 - **Why GAE?**: It balances Bias (using V(s)) and Variance (using raw rewards) with the hyperparameter $\lambda$ (`gae_lambda`).
+
+#### Step 2.5: Advantage Normalization (The Stabilizer)
+**User Question**: "why the advantage normalization stabilize the policy gradient?"
+
+```python
+mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+```
+1.  **Centered Optimization**: Without normalization, if a batch has rewards of `[100, 101, 102]`, *all* actions look "good" (positive). The policy increases probability for everything, which is inefficient.
+    -   Normalized: `[-1, 0, 1]`. Now the agent learns to avoid the sub-optimal action (100) and prefer the best one (102). It creates a clear "Good vs Bad" distinction relative to the *average* performance.
+2.  **Scale Invariance**: If we change the reward scale (e.g., multiply rewards by 1000), unnormalized gradients would explode.
+    -   Normalization forces the advantages to always have `mean=0` and `std=1`. This means the *magnitude* of the update step is consistent, regardless of whether the game gives `+1` or `+1,000,000` points.
 
 #### Step 3: PPO Optimization (The Update)
 We loop `update_epochs` (4) times over the data (Lines 925-1002).
@@ -233,3 +341,38 @@ We loop `update_epochs` (4) times over the data (Lines 925-1002).
 5.  **Entropy Bonus** - Line 966:
     `loss -= ent_coef * entropy`
     - We subtract entropy from the loss (maximizing entropy). This forces the agent to keep its options open and prevents it from committing to a single strategy too early (premature convergence).
+
+## 7. Part 4: Scheduling and Hyperparameters
+
+This section explains the scheduling logic for Learning Rate and Entropy Coefficient, used to stabilize training over long durations.
+
+### 7.1 Learning Rate Annealing (`anneal_lr`)
+**Variable**: `args.anneal_lr` (Line 818)
+**Function**: Linearly decays the learning rate from `2.5e-4` to `0.0` over the course of `total_timesteps`.
+```python
+frac = 1.0 - (update - 1.0) / num_updates
+lr_now = frac * args.learning_rate
+```
+- **Why?**: In the early stages (High LR), the agent makes big jumps to find a rough strategy. In the late stages (Low LR), it needs to "settle down" and fine-tune the parameters. If LR stays high, the agent might bounce around the optimal solution forever without converging.
+
+### 7.2 Entropy Scheduling (`ent_warm_steps`)
+**Variables**: `args.ent_warm_steps`, `ent_coef_warm`, `ent_coef_final` (Line 825)
+**Function**: A custom scheduling mechanic to force exploration logic.
+
+1.  **Phase 1: Warmup** (Steps < `ent_warm_steps`)
+    - The Entropy Coefficient is held CONSTANT at `ent_coef_warm` (usually a higher value).
+    - **Purpose**: Force the agent to explore *randomly* for a set period (e.g., 500k steps). This prevents the agent from falling into a "Local Optimum" too early (like standing still in a corner because it's safe).
+
+2.  **Phase 2: Decay** (Steps > `ent_warm_steps`)
+    - The coefficient linearly decays from `ent_coef_warm` down to `ent_coef_final`.
+    - **Purpose**: Once the agent has explored enough, we reduce the "randomness bonus" to let the agent exploit its best strategy and maximize the reward.
+
+```python
+if steps_elapsed < args.ent_warm_steps: 
+    ent_coef_now = args.ent_coef_warm
+else:
+    # Linear interpolation logic
+    frac_ent = (steps_elapsed - args.ent_warm_steps) / decay_steps
+    ent_coef_now = warm + frac_ent * (final - warm)
+```
+This is a critical "Curriculum" feature: First Explore (High Entropy), Then Exploit (Low Entropy).
