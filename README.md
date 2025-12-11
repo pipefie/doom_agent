@@ -4,6 +4,8 @@
 **Date:** 2025-12-11
 **Engine:** ViZDoom + Gymnasium + PyTorch (CleanRL)
 
+**Important:**  to install the dependencies, run `uv sync`.
+
 ---
 
 ## 1. Executive Summary
