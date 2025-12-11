@@ -1,548 +1,302 @@
-# Doom PPO Curriculum Agent
+# ViZDoom PPO Agent: A Comprehensive Engineering Report
 
-## Project Overview
-- CleanRL-style PPO agent for ViZDoom with a single training script (`doom_ppo_deadly_corridor.py`) and a dedicated evaluation script (`eval_doom_agent.py`).
-- Curriculum focus: start on **Basic**, progress to **Defend the Center**, and finish on **Deadly Corridor**.
-- Uses Gymnasium’s API with vectorized environments to keep throughput high while keeping the code path simple.
-- Reward shaping is scenario-aware to avoid the Deadly Corridor “suicide quickly” failure mode noted in Doom RL research.
+**Project Status:** 🟢 Completed (Phase 5.13 "Matador")
+**Date:** 2025-12-11
+**Engine:** ViZDoom + Gymnasium + PyTorch (CleanRL)
 
-## Current Architecture & Experiment Log
-**Date:** 2025-12-04
-**Status:** Phase 1 (Basic) - Verification
+---
 
-### Architecture Constraints (Source of Truth)
-1.  **Model:** PPO (CleanRL) + NatureCNN + LSTM.
-2.  **Action Space:** `MultiHotWrapper` over 7 shared buttons: `[FWD, BACK, TURN_L, TURN_R, STRAFE_L, STRAFE_R, ATK]`.
-    *   *Logic:* The wrapper maps discrete action indices to multi-hot vectors.
-    *   *Basic Scenario:* Uses a subset of combos (Idle, Move L, Move R, Attack, Move L+Atk, Move R+Atk).
-3.  **Normalization:**
-    *   **Advantage Normalization:** ENABLED (via `--norm-adv` flag).
-    *   **Return Normalization:** **DISABLED**. We use raw returns for value loss to preserve reward magnitude signals (critical for distinguishing high-reward events).
+## 1. Executive Summary
+This project implements a **Proximal Policy Optimization (PPO)** agent capable of mastering increasingly complex Doom scenarios through **Curriculum Learning**. Starting from a stationary target practice ("Basic"), the agent evolves into a tactical survivor capable of navigating deadly corridors, managing resources ("Scavenger"), and evading enemy fire ("Matador") in a 3D Deathmatch environment.
 
-### Current Configuration: `basic`
-*   **Scenario:** `configs/basic.cfg`
-*   **Reward Shaping:**
-    *   `kill_reward`: 10.0
-    *   `damage_reward`: 1.0 (Dense reward for aiming)
-    *   `ammo_penalty`: 0.005
-    *   `living_penalty`: 0.0
-*   **PPO Hyperparameters:**
-    *   `ent_coef`: 0.01 (Baseline)
-    *   `vf_coef`: 0.5
-    *   `learning_rate`: 2.5e-4
-    *   `gamma`: 0.99, `gae_lambda`: 0.95
+This document acts as a complete **Technical Project Memoire**, detailing the architecture, every phase of experimentation, specific training commands, quantitative results, and deep-dive explanations of the engineering challenges solved along the way.
 
-### Phase 1: Basic (Solved)
-- **Command:** `uv run python doom_ppo_deadly_corridor.py --scenario-cfg configs/basic.cfg --use-combo-actions --use-lstm --norm-adv --anneal-lr --ent-coef 0.01 --total-timesteps 1500000`
-- **Results:**
-    - **Mean Reward:** 100.96 (Max Possible: ~101)
-    - **Entropy:** Decayed to 0.05 (Deterministic Policy)
-    - **Value Loss:** ~0.3 (Stable Critic)
-- **Interpretation:** The agent has completely mastered the scenario, learning to immediately kill the monster. The low entropy indicates it is extremely confident in its policy (Move Left/Right + Attack).
-- **Checkpoint:** `checkpoints/basic_phase1_clean_basic_lstm_2025-12-04_14-10-21_seed42_step1499136.pt`
+---
 
-### Phase 2: Defend the Center (Solved)
-- **Command:** `uv run python doom_ppo_deadly_corridor.py --scenario-cfg configs/defend_the_center.cfg --load-checkpoint [Phase 1 Checkpoint] --use-combo-actions --use-lstm --norm-adv --anneal-lr --ent-coef 0.015 --total-timesteps 2000000`
-- **Results:**
-    - **Mean Reward:** ~60 (Max: ~111)
-    - **Entropy:** ~0.7-0.8 (Healthy Exploration)
-    - **Performance:** Agent consistently survives and kills multiple enemies.
-- **Interpretation:** The agent successfully transferred its aiming skills. The higher entropy (compared to Basic) is positive, showing the agent maintains the necessary stochasticity to scan for enemies in a 360-degree environment rather than collapsing into a single action. The variance in rewards (60 vs 111) reflects the inherent difficulty of the scenario (getting overwhelmed vs clearing the wave).
-- **Checkpoint:** `checkpoints/defend_center_phase2_defend_the_center_lstm_2025-12-04_16-21-49_seed42_step1999872.pt`
+## 2. System Architecture
 
-### Phase 4: Health Gathering Supreme: **SOLVED.**
-- **Challenge:** Survive in a maze with acid floors and decreasing health. No enemies.
-- **Solution:** `living_penalty = -0.1` (Reward for surviving), `health_delta_scale = 0.1` (Reward for healing).
-- **Result:** Mean Return ~22.0, Max ~60.0. The agent learned to navigate and collect health packs.
-- **Key Insight:** We re-mapped the "Run & Gun" neuron (Index 7) to "Move Forward", allowing the agent to transfer its movement preference from Phase 3.
+### Neural Network Architecture
+The agent uses a standard Actor-Critic architecture tailored for 3D inputs:
+*   **Visual Encoder:** `NatureCNN`
+    *   Conv1: 32 filters, 8×8 kernel, stride 4
+    *   Conv2: 64 filters, 4×4 kernel, stride 2
+    *   Conv3: 64 filters, 3×3 kernel, stride 1
+    *   Flatten → Linear to 512 units with ReLU.
+*   **Memory (Recurrent):** **LSTM** (512 units)
+    *   Crucial for "Deadly Corridor" to handle partial observability (e.g., remembering enemies around corners).
+    *   Hidden states are masked on `done` flags to ensure clean episodic memory resets.
+*   **Heads:**
+    *   **Actor:** Categorical distribution over 7 discrete buttons (`FWD`, `BACK`, `TURN_L`, `TURN_R`, `STRAFE_L`, `STRAFE_R`, `ATK`).
+    *   **Critic:** Predicts value function $V(s)$ (orthogonal init, std=1.0).
 
-- **Phase 5: Deathmatch Simple:** **IN PROGRESS.**
-    - **Goal:** Kill enemies in a complex 3D map using `autoaim`.
-    - **Phase 5.1 (Failed):** "The Wall Spam Incident".
-        - *Settings:* `ammo_penalty=0.0`, `living_penalty=0.0`.
-        - *Result:* Agent hoarded ammo and punched walls. Zero cost to exist/shoot led to lazy local optima.
-    - **Phase 5.2 (Failed):** "Tactical Aggression".
-        - *Settings:* `ammo_penalty=0.005`, `living_penalty=0.05`.
-        - *Result:* Agent still spammed walls. The penalty was too low to discourage waste.
-    - **Phase 5.3 (Failed):** "The Sniper Economy".
-        - *Settings:* `ammo_penalty=0.5`.
-        - *Result:* Agent became a pacifist. Too afraid to shoot.
-    - **Phase 5.4 (Failed):** "Balanced Economy".
-        - *Settings:* `ammo_penalty=0.02`, `living_penalty=0.01`.
-        - *Result:* Agent evolved into a "Camper". Hides in health room, spams door. Profitable but boring.
-    - **Phase 5.5 (Failed):** "The Hunter Economy".
-        - *Settings:* `living_penalty=0.1`, `ammo_penalty=0.1`.
-        - *Result:* User felt ammo penalty was too high. Agent still humped walls (remnant of Phase 4).
-    - **Phase 5.6 (Failed):** "Anti-Wall-Humping".
-        - *Settings:* `wall_penalty=0.5`.
-        - *Result:* Agent stopped humping but didn't fight back effectively.
-    - **Phase 5.7 (Current):** "The Revenge Mechanic" (Pain Rage).
-        - *Problem:* Agent exhibited two major flaws:
-            1.  **Wall Humping:** Persistently trying to run through walls (remnant of Phase 4 "Runner" brain).
-            2.  **Passive Victim:** Taking damage without turning to face the attacker (lack of "Killer Radar").
-        - *Solution:*
-            1.  **Anti-Wall-Humping (`wall_penalty=0.5`):** If the agent presses a Move key but its position doesn't change (distance < 2.0), it gets penalized. This forces it to learn that "Pushing Wall = Bad", "Turning = Good".
-            2.  **Pain Rage (`pain_rage_multiplier=4.0`):** When the agent takes damage, it enters "Rage Mode" for ~2 seconds (70 steps). During this window, **Kill Reward** and **Damage Reward** are multiplied by **4x**.
-        - *Hypothesis:* The massive financial incentive to kill *immediately* after being hurt will train the agent to snap-turn towards damage sources, effectively creating a "Radar of Killing" behavior.
-    - **Phase 5.8 (Current):** "Calculated Risk" (Survivor's Rage).
-        - *Problem:* Phase 5.7 succeeded too well. The agent became a "Kamikaze", trading its life for high-value "Rage Kills" (40pts vs 5pts death penalty). Episodic length crashed as it rushed into death.
-        - *Solution:*
-            1.  **Increase Death Penalty:** 5.0 -> **25.0**. Dying now wipes out the profit of a single Rage Kill.
-            2.  **Tune Rage:** `pain_rage_multiplier` 4.0 -> **3.0**. Still profitable, but less "all-in".
-            3.  **Health Cost:** `health_penalty` 0.05 -> **0.1**.
-            4.  **Boost Kill Reward:** 10.0 -> **15.0**. To ensure that *surviving* and killing is significantly more profitable than dying.
-        - *Hypothesis:* By making death expensive, we force the agent to use its "Rage" for *survival* (killing the threat to stop the pain) rather than *suicide* (trading life for points).
-    - **Phase 5.9 (Current):** "The Survivalist" (Resource Awareness).
-        - *Problem:* The agent became a "Temerary Killing Machine" (reckless). It kills effectively but ignores health and ammo pickups, eventually running dry and dying. It doesn't understand that *resources = life*.
-        - *Solution:*
-            1.  **Ammo Reward (`ammo_reward=0.05`):** Explicitly reward gaining ammo. Picking up a clip (10 bullets) is now worth 0.5 points.
-            2.  **Health Reward (`health_delta_scale=0.05`):** Explicitly reward gaining health. Picking up a medkit (25hp) is now worth 1.25 points.
-        - *Hypothesis:* By attaching immediate positive value to resource acquisition, we teach the agent that scavenging is a valid and profitable sub-objective, creating a loop of "Kill -> Scavenge -> Kill".
-    - **Phase 5.10:** "Robust Visualization" (Tooling).
-        - *Problem:* `GLX BadValue` errors prevented native window rendering in headless environments, blocking visual debugging.
-        - *Solution:* Implemented OpenCV-based visualization (`--visual-envs` arg). The main process grabs frames from the `SyncVectorEnv` and displays them using `cv2.imshow` and `cv2.waitKey`.
-    - **Phase 5.11:** "The Arms Dealer" (Economy Fix).
-        - *Problem:* Agent ignored non-bullet ammo and fought with bare hands.
-        - *Root Cause:* `kill_reward` (15.0) heavily outweighed `ammo_reward` (0.05).
-        - *Solution:* Rebalanced economy. Increased `ammo_reward` to 0.20 and decreased `kill_reward` to 10.0.
-    - **Phase 5.12:** "The Scavenger" (Universal Vision).
-        - *Problem:* Agent was "blind" to Shells, Rockets, and Cells because the config only exposed `AMMO2` (Bullets).
-        - *Solution:*
-            1.  **Universal Tracking:** Modified `VizDoomGymnasiumEnv` to track `AMMO2`, `AMMO3`, `AMMO4`, and `AMMO5` variables independently, summing their deltas for rewards.
-            2.  **Panic Penalty:** Added a constant penalty (`-0.05` per step) if the current weapon's ammo (`SELECTED_WEAPON_AMMO`) drops to 0.
-    - **Phase 5.13 (Current):** "The Matador" (Tactical Evasion).
-        - *Problem:* Agent displayed "temerary" (reckless) behavior, face-tanking damage to trade hits.
-        - *Root Cause:* `pain_rage_multiplier=2.0` acted as a "Berserker" mechanic, doubling rewards after taking damage. This made getting hit mathematically profitable.
-        - *Solution:*
-            1.  **Disable Rage:** Set `pain_rage_multiplier = 1.0` (Neutral).
-            2.  **Increase Pain:** Raised `health_penalty` to **0.5**. Taking damage is now strictly net-negative.
-        - *Hypothesis:* The agent will be forced to learn dodging/strafing behavior to preserve its score.
+### Environment Stack
+*   **Engine:** ViZDoom (Doom II WADs).
+*   **Interface:** `Gymnasium` (Standard API) with `SyncVectorEnv` (8 parallel envs).
+*   **Dependency Management:** `uv` (`pyproject.toml` + `uv.lock`) for reproducible builds.
 
-## Environment Setup (ViZDoom + Gymnasium + uv)
-- Dependencies are managed via `uv` (`pyproject.toml` + `uv.lock`). Run commands with `uv run python ...` to ensure the right environment.
-- ViZDoom configs and WADs live under `configs/` (e.g., `configs/basic.cfg`, `configs/defend_the_center.cfg`, `configs/deadly_corridor.cfg`).
+---
 
-## Technical Challenges & Solutions
+## 3. Curriculum Learning Log (Detailed)
 
-### Action Space Mismatch (Curriculum Transfer)
-- **Problem:** Transferring from `defend_the_center` (6 actions) to `deadly_corridor` (12 actions) caused a `RuntimeError` due to shape mismatch in the Policy Head (`actor.weight`).
-- **Solution:** Implemented **Flexible Checkpoint Loading** in `doom_ppo_deadly_corridor.py`. The script now performs a "Partial Load":
-    1.  **Loads** compatible layers (CNN Feature Extractor, LSTM Memory, Critic).
-    2.  **Skips** mismatched layers (Actor/Policy Head).
-    3.  **Re-initializes** the skipped layers to learn the new action space from scratch.
-- **Result:** Enables seamless transfer learning across scenarios with different control schemes (e.g., Turret -> Moving Agent).
-
-### Exploding Reward (Native WAD Conflict)
-- **Problem:** In `deadly_corridor`, the agent received massive, noisy rewards (e.g., +20, -20 per step) even without killing enemies. This caused "suicide rushing" as the agent surfed the native reward function.
-- **Root Cause:** The WAD has a built-in distance-based reward system that conflicted with our Python-side `progress_scale`.
-- **Solution:** Enforced **"Python-First" Rewards** by explicitly zeroing out the game engine's `base_reward` in `step()`:
-    ```python
-    self.game.make_action(...)
-    base_reward = 0.0 # Ignore native rewards
-    ```
-- **Result:** The agent now relies 100% on our calibrated shaping (Kill, Max Progress, Damage Penalty), eliminating the noise.
-- The wrapper `VizDoomGymnasiumEnv` normalizes grayscale frames to `[0, 1]`, stacks 4 frames of size 84×84, and exposes a discrete one-hot action space aligned with the available buttons in each scenario.
-## Environment & Configuration Standards
-**Critical Update (2025-12-04):** We have standardized all `.cfg` files to ensure curriculum compatibility and prevent "double penalty" issues.
-
-### 1. Universal Action Space (The "7-Button" Rule)
-All configuration files (`basic.cfg`, `defend_the_center.cfg`, `deadly_corridor.cfg`) must expose the **exact same 7 buttons** in the **exact same order**. This ensures the Neural Network's policy head (which outputs 7 logits) remains valid when transferring checkpoints between scenarios.
-
-**Required Button List:**
-```ini
-available_buttons = {
-    MOVE_FORWARD
-    MOVE_BACKWARD
-    TURN_LEFT
-    TURN_RIGHT
-    MOVE_LEFT
-    MOVE_RIGHT
-    ATTACK
-}
-```
-
-### 2. "Python-First" Reward Logic (Zero-Sum Native Rewards)
-We have **silenced** the Doom Engine's native rewards to ensure Python is the Single Source of Truth for reward shaping.
-*   **Config Setting:** `living_reward = 0`, `death_penalty = 0`.
-*   **Reason:** Reward shaping is additive. If the engine gives `-1.0` and Python gives `-0.01`, the total is `-1.01`, which destroys fine-tuned incentives. By setting native rewards to 0, we avoid the "Double Penalty" trap that causes suicide loops.
-
-### 3. Variable Requirements
-To support our reward shaping wrapper, all configs must expose the following game variables:
-*   `KILLCOUNT`: For kill rewards.
-*   `DAMAGECOUNT`: For dense aiming rewards.
-*   `HEALTH`: For health loss penalties.
-*   `AMMO2`: For ammo usage penalties.
-
-### 4. Sensory Tuning
-For `defend_the_center` and `deadly_corridor`, we use `game_args = +m_yaw 20` to increase horizontal mouse sensitivity, enabling the rapid 180-degree turns required for survival.
-
-## Neural Network Architecture
-- Feature extractor: NatureCNN
-  - Conv1: 32 filters, 8×8 kernel, stride 4
-  - Conv2: 64 filters, 4×4 kernel, stride 2
-  - Conv3: 64 filters, 3×3 kernel, stride 1
-  - Flatten → Linear to 512 units with ReLU
-- Optional memory: single-layer LSTM after the CNN (`--use-lstm`, hidden size `--lstm-hidden-size`, default 512). Hidden state is masked by the done flags each step so memories reset when an env ends. This helps with partial observability (e.g., peeking corners in Deadly Corridor).
-- Heads:
-  - Actor: linear → categorical policy over discrete actions (orthogonal init, std=0.01)
-  - Critic: linear → scalar value (orthogonal init, std=1.0)
-
-## PPO Algorithm Details
-- Vectorized rollout with `gym.vector.SyncVectorEnv`; batch size = `num_envs * num_steps`.
-- Generalized Advantage Estimation (GAE) with `gamma` and `gae_lambda`.
-- Clipped surrogate objective (`clip_coef`), entropy bonus (`ent_coef`), and value loss with clipping (`vf_coef`).
-- Optional learning rate annealing to 0 over training (`--anneal-lr`).
-- Gradient clipping via `nn.utils.clip_grad_norm_` to stabilize updates.
-- Optional KL early-stop (`--target-kl`) and advantage normalization (`--norm-adv`).
-- Episodic stats in TensorBoard (`charts/episodic_return`, `charts/episodic_length`) come from `RecordEpisodeStatistics`. They appear when an env terminates/truncates; we log both `infos["final_info"]` and a direct `infos["episode"]` fallback to cover different Gymnasium versions.
-
-## Reward Shaping
-### Basic + Defend the Center
-- Mild shaping only: reward per kill (`--kill-reward`, default 5.0) and ammo usage penalty (`--ammo-penalty`, default 0.01).
-- Progress, health, and death shaping are off by default (set to 0.0).
-
-### Deadly Corridor (anti-suicide shaping)
-- Kill reward and ammo penalty remain active, with stronger defaults for this scenario.
-- Progress shaping: `POSITION_X` delta is rewarded via `--progress-scale` (default 0.05) so forward motion is valuable even before the sparse terminal reward.
-- Health shaping: `--health-penalty` (default 0.05) nudges the agent away from reckless damage intake.
-- Death shaping: `--death-penalty` (default 5.0) lightly penalizes premature deaths so that the terminal reward still dominates.
-- These signals counter the “suicide quickly” behavior by valuing survival and forward progress while keeping the end-of-corridor reward the primary objective.
-- Experimental shaping adjustments (Deadly Corridor):
-  - High progress_scale (0.02) + moderate kill reward (15) led to a rushing, enemy-ignoring policy.
-  - Raising kill reward (25) and lowering progress (0.005) reduced rushing but still produced short, brittle episodes.
-  - Pushing further toward combat/survival (kill 30–50, death 25–50) while zeroing progress and easing ammo penalty increases the incentive to clear threats.
-- Increasing entropy (e.g., 0.02–0.05) and lowering frame_skip (e.g., 2) are used to break deterministic “rush one flank” habits and improve control.
-- Always match eval shaping to training; evaluating with default shaping can give misleading returns and behavior.
-- Added living_penalty + kill_grace_steps: a small per-step penalty when no kill has occurred recently, reset on each kill, to discourage “run forward without clearing threats.” Use carefully; if too high it can reintroduce rushing.
-- Added forward_penalty gated on kill_grace_steps: if `steps_since_kill > kill_grace_steps` and POSITION_X increases, subtract `forward_penalty * delta_x` to discourage advancing while ignoring enemies.
-- Despite these tweaks, multiple runs on skill 5 still converge to deterministic rushing (short episodes, minimal kills). Next mitigations: lower `doom_skill` temporarily to teach clearing both sides, run with high entropy (e.g., 0.1–0.15) and frame_skip=1, then fine-tune back at full difficulty with the same survival-heavy shaping. Consider simplifying the action set or using a short high-entropy schedule for Deadly to avoid early collapse.
-- Additional shaping/struggles log:
-  - Added `damage_reward` (reward per DAMAGECOUNT) and optional `health_delta_scale` (symmetric reward/penalty for health changes) to encourage hits/health preservation; still seeing rush/die at skill 5.
-  - Living/forward penalties kept tiny (or 0) to avoid incentivizing suicide; forward_penalty uses POSITION_X delta gated on `steps_since_kill`.
-  - Action sets per scenario when `--use-combo-actions` is on: Basic uses a small set (idle, forward, turn L/R, attack, forward+attack, turn+attack) to reduce motion noise; Defend uses a mid-size set (adds strafe+attack); Deadly uses the full 13-action set (adds strafe, backward + attack). Head size stays consistent within a run; loading older 7-action checkpoints drops the actor head and skips optimizer state to avoid shape errors.
-  - Entropy warm-up flags (`--ent-coef-warm`, `--ent-warm-steps`, `--ent-coef-final`) added; high entropy early can prevent deterministic collapse but has not fully fixed the rush/die failure at skill 5.
-  - Basic training with the small combo set and low entropy: agent still tends to wander/shoot randomly; higher kill reward (e.g., 10) and lower entropy (e.g., 0.002) are being tried to force purposeful shooting; convergence remains slow.
-
-### Deadly Corridor: Detailed Walkthrough of Current Approach
-- Problem observed: At skill 5 the agent repeatedly converges to “rush forward and die” with very short episodes. Even with high kill/death rewards and zero progress reward, entropy collapses early and PPO updates become tiny, so the policy stays deterministic. One-side bias (looks left/right only) persists, and the agent often ignores enemies after the first pair.
-- Action set change: For Deadly Corridor only, we replaced one-hot actions with a curated combo set (idle; forward/turn/strafe; attack; forward+attack; strafe+attack; turn+attack; backward+attack). This removes pure “run forward” actions and forces turning/shooting combinations.
-- Reward shaping now available:
-  - Kill/death: high (e.g., kill 80, death 100).
-  - Progress: set to 0 to eliminate forward lure.
-  - Health penalties: `health_penalty` for loss; optional symmetric `health_delta_scale` to reward medkit gains/penalize loss.
-  - Damage reward: per point of DAMAGECOUNT to reward hits even before kills.
-  - Living penalty + kill_grace_steps: small per-step cost when no kill has happened recently (use tiny values or 0 to avoid incentivizing suicide by rushing).
-  - Forward penalty: gated on `steps_since_kill > kill_grace_steps`, subtracts `forward_penalty * delta_x` to discourage advancing without clearing threats.
-- Entropy schedule: Added warm start (`--ent-coef-warm`, `--ent-warm-steps`, `--ent-coef-final`) so Deadly can run with high entropy early (e.g., 0.2 for 200k steps) and decay to target (e.g., 0.05) to avoid early deterministic collapse.
-- Frame skip: use `frame_skip=1` for finer control/aiming in Deadly; frame_skip >1 made rushing more attractive.
-- Checkpoint loading: When action-space changes (7 → 13 actions), checkpoints are loaded with `strict=False` to reuse shared layers and reinit the new head. Eval does the same.
-- What hasn’t solved it yet at skill 5: even with the above, runs often stay short; more kills on the first pair but still stuck. If keeping skill 5, combine the combo action set + high-entropy warm phase + survival-heavy shaping and keep living/forward penalties very small.
-- If all else fails: temporarily lower `doom_skill` in `deadly_corridor.cfg` to teach clearing both sides, then fine-tune back at skill 5 with the same flags; or further simplify the action set and run a shorter high-entropy schedule.
-
-## Curriculum Learning Strategy
-- Choose scenarios by name (`--scenario-name basic|defend_the_center|deadly_corridor`) or by config path (`--scenario-cfg ...`).
-- Warm-start the next stage with `--load-checkpoint` to reuse the policy (and optimizer state) learned on the previous scenario.
-- Suggested manual sequence (timesteps are examples; adjust as needed):
-  - Basic: `uv run python doom_ppo_deadly_corridor.py --scenario-name basic --total-timesteps 200000 --track`
-  - Defend the Center (warm start): `uv run python doom_ppo_deadly_corridor.py --scenario-name defend_the_center --load-checkpoint <basic_ckpt> --total-timesteps 400000 --track`
-  - Deadly Corridor (warm start with richer shaping): `uv run python doom_ppo_deadly_corridor.py --scenario-name deadly_corridor --load-checkpoint <defend_ckpt> --total-timesteps 800000 --track`
-- `total-timesteps` controls how many steps this run will add; `global_step` continues from the checkpoint so logs remain contiguous.
-
-## Training & Evaluation Usage
-- Train a scenario (example with CUDA and TensorBoard):
-  - `uv run python doom_ppo_deadly_corridor.py --scenario-name basic --total-timesteps 200000 --num-envs 8 --num-steps 128 --cuda --track`
-- Enable recurrent policy (helps Deadly Corridor): add `--use-lstm --lstm-hidden-size 512` to the command. When using LSTM, `num_envs` must be divisible by `num_minibatches` (recurrent batching is by envs, not flattened steps).
-- Override shaping if needed (e.g., weaken ammo penalty): add `--ammo-penalty 0.005`.
-- Evaluate a checkpoint with matching scenario/shaping:
-  - `uv run python eval_doom_agent.py --checkpoint checkpoints/<ckpt>.pt --scenario-name deadly_corridor --episodes 5 --render --deterministic --cuda`
-  - Evaluation accepts the same shaping flags to keep reward accounting aligned with training (`--progress-scale`, `--health-penalty`, etc.).
-  - If the checkpoint was trained with LSTM, pass `--use-lstm --lstm-hidden-size 512` to evaluation so the architecture matches.
-
-## Logging and Checkpoints
-- TensorBoard logs: `runs/<exp_name>_<scenario>_<arch>_<timestamp>_seed<seed>` where `<arch>` is `ff` or `lstm`, making it easy to compare recurrent vs feedforward runs. Inspect with `tensorboard --logdir runs`.
-- Checkpoints: saved under `checkpoints/` every `--save-interval` global steps and at the end of training. Filenames include the run name and `global_step`, and the run name carries the `ff`/`lstm` tag.
-- `global_step` counts environment steps across all vectorized envs and continues from any loaded checkpoint so you can see uninterrupted progress across curriculum stages.
-
-## Shared Action Set (Checkpoint Compatibility)
-- Problem: scenarios expose different buttons (Basic: 3 actions; Defend: 3; Deadly Corridor: 7). Checkpoints trained on fewer actions fail to load into wider action heads.
-- Solution: the training/eval scripts now default to a unified 7-action list (forward/backward, turn left/right, strafe left/right, attack) via `--use-shared-actions` (on by default). This keeps the policy head shape fixed across all scenarios, so you can warm-start through the curriculum and evaluate any checkpoint anywhere.
-- You can disable with `--no-use-shared-actions`, but then checkpoints will only load in matching scenarios.
-
-## Recurrent PPO Notes (LSTM)
-- LSTM is optional (`--use-lstm`) and sits after the CNN encoder. Hidden size is configurable (`--lstm-hidden-size`, default 512).
-- Hidden states are masked with the `done` flags each step so episodes reset memory cleanly per env.
-- Rollout storage keeps LSTM states as (time, env, layer, hidden) and reorders to (layer, env, hidden) right before feeding the PyTorch LSTM. This avoids the hidden-shape mismatch bug (expected [1, batch, hidden], got [2, batch, hidden]) seen in earlier runs.
-- When LSTM is on, minibatching is by environments (`num_envs` must be divisible by `num_minibatches`); this preserves temporal order within each env during the recurrent update.
-
-## Curriculum Progress & Early Results
-- Basic (500k steps, pre-shared-actions): produced a stable policy suitable for warm-starting Defend. (Action head size: 3.)
-- Defend the Center (warm-started from Basic, 500k steps; head size 3):
-  - Deterministic eval (5 eps): shaped reward ≈ 52–71 over ~164–226 steps → ~10–14 kills/episode given +5 kill reward and light ammo penalty. Indicates stable defense behavior with modest variance.
-  - Value head improved from negative explained variance early to ~0.6–0.7, and entropy dropped to ~0.25–0.30, showing convergence toward a focused policy.
-- Next: to continue into Deadly Corridor without shape mismatches, retrain Basic and Defend with the shared action set (default now on), then train Deadly Corridor from the Defend checkpoint. This aligns all checkpoints to the 7-action head.
-- Basic (500k steps, shared-actions + LSTM, run `doom_ppo_deadly_corridor_basic_lstm_2025-12-01_09-29-19_seed42`):
-  - Entropy fell from ~1.9 → ~0.12, so the policy became highly deterministic by the end of training.
-  - Value loss started extremely high (~1800) and decayed below ~50 near the end; explained variance was hugely negative early and hovered around ~0 to mildly negative later, so the critic is still imperfect but much improved versus the start.
-  - Policy loss moved from large positive to small negative/near-zero, and KL stayed tiny throughout, indicating stable but conservative PPO updates.
-  - Episodic returns should be read from TensorBoard (`charts/episodic_return`) for the final verdict on performance; the logs above show optimization stabilizing but the value fit is not yet strong. Consider a short extra run or modest vf_coef/entropy tweaks if returns plateau too low.
-- Basic (500k steps, shared-actions + LSTM, vf_coef=0.4, run `doom_ppo_deadly_corridor_basic_lstm_2025-12-01_11-04-00_seed42`):
-  - Entropy decreased from ~1.9 to ~0.45 and then hovered there, indicating the policy retained some stochasticity instead of collapsing fully deterministic.
-  - Value loss dropped from ~1900 to ~200 but explained variance remained negative, so the critic still underfits; however policy updates stayed stable (KL ~0, policy loss small/negative).
-  - Smoothed episodic return reached ~16.6 by the end (from TensorBoard), which is a reasonable improvement on Basic; if you want more, you can extend training or gently adjust entropy/vf weights, but this checkpoint is usable for warm-starting Defend with the LSTM + shared action head.
-- Defend the Center (500k steps, shared-actions + LSTM warm start from the above Basic, vf_coef=0.4, run `doom_ppo_deadly_corridor_defend_the_center_lstm_2025-12-01_12-10-19_seed42`):
-  - Entropy fell from ~1.7 to ~0.17, so the policy converged to a mostly deterministic defender.
-  - Value loss dropped to low single digits and explained variance climbed to ~0.9+, indicating a well-fit critic on this task.
-  - Policy losses stayed small/negative and KL remained tiny, suggesting stable PPO updates. This checkpoint is ready to warm-start Deadly Corridor with the LSTM + shared action head.
-- Deadly Corridor (800k steps, shared-actions + LSTM warm start from Defend, vf_coef=0.4, run `doom_ppo_deadly_corridor_deadly_corridor_lstm_2025-12-01_13-30-55_seed42`):
-  - Entropy collapsed to ~0.1–0.2, so the policy is very deterministic and visually rushes the corridor, often ignoring enemies.
-  - Value loss remained high (hundreds–thousands) with negative explained variance, indicating a poorly fit critic and noisy returns; episodic returns fluctuated heavily.
-  - Current shaping (kill=15, progress=0.02, health_penalty=0.05, death_penalty=5) likely over-rewards forward progress. Next run should rebalance toward combat: raise kill reward (e.g., 20–25), lower progress_scale (e.g., 0.005–0.01), and increase death penalty (e.g., 15–20) while keeping health penalty on. Continue from this checkpoint to test the new shaping quickly.
-  - Visual inspection: policy often turns right/rushes, gets killed frequently. This aligns with the critic underfit and the progress-heavy shaping; prioritize kill/death shaping over progress to shift behavior toward clearing enemies.
-- Deadly Corridor (800k steps, shared-actions + LSTM warm start, vf_coef=0.4, stronger kill/death shaping run `doom_ppo_deadly_corridor_deadly_corridor_lstm_2025-12-01_15-11-20_seed42` with kill=25, progress=0.005, ammo_penalty=0.01, health_penalty=0.05, death_penalty=15):
-  - Entropy stayed low (~0.1–0.25), so policy remained highly deterministic; episodic_return smoothed around ~9.7—still weak.
-  - Value loss was very large early but later EV hovered ~0.7–0.85; critic improved but returns remained modest, suggesting the policy is still brittle (e.g., simple turning/rushing, frequent deaths).
-  - Next steps: further tilt toward combat/survival (e.g., even lower progress_scale, higher death_penalty, maintain kill reward), or consider modest entropy increase to escape the deterministic rush policy.
-  - Visual inspection: agent kills one nearby enemy then rushes, ignoring the right side; episodes end quickly without reaching the goal.
-- Deadly Corridor eval note (run `doom_ppo_deadly_corridor_deadly_corridor_lstm_2025-12-01_15-11-20_seed42_step1799168.pt`):
-  - Evaluating with default shaping (kill=10, progress=0.05, death=5, ammo=0.02) produced very short episodes (~50 steps) and high shaped returns (~800) but behavior was still brittle (clears first pair, dies on second). This mismatch shows eval must mirror training shaping.
-  - Re-evaluate with the training shaping flags (kill=25, progress=0.005, ammo=0.01, health_penalty=0.05, death_penalty=15) to get meaningful metrics. If behavior remains stuck, continue training with the more survival-focused shaping (kill/death higher, progress lower/zero, slight entropy bump) described above.
-- Deadly Corridor (in progress): retraining from the Defend LSTM checkpoint with a stronger combat/survival tilt to break the rush-only policy:
-  - Shaping: `--kill-reward 30`, `--death-penalty 25`, `--progress-scale 0.001`, `--health-penalty 0.05`, `--ammo-penalty 0.005`; entropy bumped to `--ent-coef 0.02`.
-  - Rationale: de-emphasize forward progress, heavily reward kills and penalize deaths, keep health pressure, and add a bit more exploration to escape the deterministic left-side-only rush.
-
-## Full Script Walkthrough: `doom_ppo_deadly_corridor.py`
-
-This section is a line-by-line style walkthrough so you can understand how every piece fits together. Follow along in the file from top to bottom.
-
-1) Imports and utilities
-- Standard libs: argparse (CLI), os/time/datetime, dataclasses (config handling), typing.Tuple for type hints.
-- Core deps: OpenCV (`cv2`) for frame processing; Gymnasium as the environment API; NumPy for array ops; PyTorch (`torch`, `nn`, `optim`, `Categorical`) for the model/optimizer; TensorBoard `SummaryWriter` for logging; `vizdoom` for the underlying Doom engine.
-
-2) Config dataclass and scenario defaults
-- `DoomConfig` holds environment knobs: scenario path/name, frame preprocessing (84x84 grayscale, stack=4), action sharing, and reward-shaping hyperparameters (kill reward, ammo penalty, progress reward, health penalty, death penalty).
-- `SCENARIO_CFG_MAP` maps friendly scenario names to `.cfg` files.
-- `SCENARIO_SHAPING_DEFAULTS` provides per-scenario shaping. Deadly Corridor gets stronger shaping (kill=10, ammo penalty=0.02, progress=0.05, health penalty=0.05, death penalty=5) to counter the suicide trap.
-- `SHARED_ACTION_BUTTONS` is the 7-button superset (move/turn/strafe + attack) used to keep the policy head compatible across Basic/Defend/Deadly.
-
-3) Environment wrapper: `VizDoomGymnasiumEnv`
-- Subclasses `gym.Env` and enforces Gymnasium API (`terminated`, `truncated`).
-- Constructor: loads the ViZDoom config, optionally overrides available buttons to the shared list, registers required game variables for shaping (kills, ammo, position, health), and initializes the game.
-- Action space: discrete one-hot over available buttons; uses an identity matrix as action list.
-- Observation space: Box in [0,1] with shape (frame_stack, 84, 84); internal buffer `_frames` holds the stack.
-- `_register_shaping_variables`: adds ViZDoom game variables before `init()` so they are tracked in `get_state()`. Only requests variables actually needed given shaping settings.
-- `_find_var_index`: helper to locate variable indices in the game’s available variables array.
-- `_process_frame`: handles layout differences (CHW vs HWC), converts to grayscale, resizes to 84x84, normalizes to [0,1]. This fixes the channel-order mismatch between ViZDoom/OpenCV (HWC) and PyTorch (CHW).
-- `_get_obs`: returns a copy of the stacked frames buffer.
-- `_update_game_vars`: caches killcount, ammo, position, and health from the latest state for delta-based shaping.
-- `_shape_reward`: applies shaping on top of the base game reward:
-  - +`kill_reward` per delta kill count
-  - -`ammo_penalty` per ammo spent
-  - +`progress_scale` * delta POSITION_X (Deadly Corridor progress)
-  - -`health_penalty` per health lost
-  - optional `death_penalty` on termination if no state is available (avoids suicide optima)
-- `reset`: seeds if provided, starts a new episode, processes the first frame, fills the stack with it, and initializes shaping trackers.
-- `step`: maps discrete action to one-hot Doom buttons, steps with frame skip, checks termination, processes next frame into the stack, shapes the reward, and returns `(obs, reward, terminated, truncated, info)`.
-- `render`: noop because ViZDoom handles its own window when `render_mode="human"`.
-- `close`: closes the ViZDoom game instance.
-
-4) Env factory helpers
-- `make_vizdoom_env` returns a thunk to create a single wrapped env, optionally rendering the first env. Seeds each env with `seed + idx` and wraps with `RecordEpisodeStatistics` for episodic returns/lengths.
-- `make_envs` builds a `SyncVectorEnv` of these thunks for vectorized rollouts.
-
-5) Model architecture
-- `layer_init`: orthogonal init with configurable std and bias; stabilizes PPO by controlling initial scales.
-- `NatureCNN`: three conv layers (32@8x8/4, 64@4x4/2, 64@3x3/1) + flatten, then linear to 512 with ReLU. A dummy forward computes the flattened size dynamically.
-- `PPOAgent`: holds the shared CNN body, optional LSTM, plus two heads:
-  - Optional LSTM (`--use-lstm`): single-layer, hidden size configurable (`--lstm-hidden-size`, default 512). The LSTM input is the 512-d CNN features; its hidden state is masked by the `done` flags so memories reset per env episode. This improves partial observability (e.g., Deadly Corridor corners/projectiles).
-  - Actor head: linear to `action_space.n` logits (std=0.01).
-  - Critic head: linear to scalar value (std=1.0).
-- `get_action_and_value` runs features (and LSTM if enabled), samples or evaluates provided actions via `Categorical`, and returns (action, logprob, entropy, value, new_lstm_state).
-
-6) CLI parsing (`parse_args`)
-- Env settings: scenario cfg/name, checkpoint loading, env count, rollout steps, total timesteps, render flag, seed, shared actions toggle.
-- Reward shaping args (override defaults if passed): kill, ammo, progress, health, death.
-- PPO hyperparams: LR (2.5e-4), optional anneal, gamma, GAE lambda, minibatches/epochs, advantage norm, clip coef, entropy/value coefs, max grad norm, target KL.
-- Logging/checkpoints: TensorBoard toggle/dir, exp name, checkpoint save interval/dir.
-- System: CUDA flag, deterministic cudnn toggle.
-
-7) Main training loop
-- Resolve scenario name → cfg path (via map) and derive defaults. Apply shaping defaults unless CLI overrides.
-- Build `DoomConfig` with resolved shaping and shared-actions setting. Print scenario and shaping for visibility.
-- Basic asserts, batch/minibatch sizing.
-- Seeding: NumPy/torch; device selection respects `--cuda`. Optional cudnn deterministic mode.
-- Create vectorized envs (`SyncVectorEnv`). Get single observation/action spaces for model construction.
-- Instantiate `PPOAgent` and Adam optimizer (eps=1e-5).
-- If `--use-lstm` is on: initialize per-env LSTM states, store them through the rollout, and batch updates by environments (not flattened steps). LSTM states are masked by `done` so episodes reset memory cleanly.
-- Optional warm start: load checkpoint model/optimizer/global_step for curriculum continuation.
-- Logging setup: `run_name` includes scenario and timestamp; TensorBoard `SummaryWriter` if `--track`; ensure checkpoint dir exists.
-- Rollout storage buffers: obs, actions, logprobs, rewards, dones, values sized (num_steps, num_envs, ...).
-- Reset envs to get initial `next_obs`; `next_done` zeros.
-- Compute `num_updates = total_timesteps // batch_size`; print run banner with derived sizes.
-
-Rollout collection (per update)
-- Optional LR anneal: linear decay over updates; otherwise fixed LR. Track `lr_now` for logging.
-- For each step in rollout:
-  - Save obs/done flags.
-  - Convert obs to torch on device; get actions, logprobs, values from agent (no grad).
-  - Step envs with the sampled actions; receive reward, terminated, truncated; combine to `done`.
-  - Store rewards and done flags; update `next_obs`/`next_done`.
-  - If `RecordEpisodeStatistics` produces `final_info`, log episodic return/length to TensorBoard.
-- After rollout: bootstrap value on `next_obs` for GAE.
-
-GAE and returns
-- Compute advantages backwards with GAE using gamma and lambda, handling terminal flags (`next_nonterminal`).
-- Returns = advantages + values.
-
-Batch flattening and preprocessing
-- Flatten buffers to shape (batch_size, …) and convert to torch tensors on device.
-- Optional advantage normalization (`--norm-adv`).
-
-PPO update
-- Shuffle indices each epoch; iterate minibatches.
-- For each minibatch:
-  - Forward pass to get new logprobs, entropy, values.
-  - Compute probability ratio, estimate KL, and track clip fractions.
-  - Policy loss: clipped surrogate max of unclipped vs clipped.
-  - Value loss: clipped vs unclipped MSE, take max, scaled by 0.5.
-  - Entropy bonus: encourages exploration.
-  - Total loss = policy loss - ent_coef * entropy + vf_coef * value loss.
-  - Backprop, zero grads, apply grad clipping (`clip_grad_norm_`) to prevent exploding gradients, optimizer step.
-  - Early-stop inner loop if `target_kl` exceeded.
-
-Logging per update
-- Explained variance is computed as a sanity check for value function fit.
-- If TensorBoard enabled: log LR, clip fraction, losses (value/policy/entropy), approx KL, explained variance.
-- Every 10 updates (or final): print FPS and latest loss/entropy/KL/EV snapshot.
-
-Checkpointing
-- Save model/optimizer/global_step/args every `save_interval` steps or at the end. File name includes run name and global step.
-
-Teardown
-- Close envs and TensorBoard writer, print total training time and final step counts.
-
-Execution entry
-- `if __name__ == "__main__": main()` so running `python doom_ppo_deadly_corridor.py ...` starts training with the above pipeline.
-
-## Recent Experiments, Troubles, and Lessons (Ongoing Log)
-- **Action-set curriculum:** We now use scenario-specific combo actions when `--use-combo-actions` is enabled: Basic = small set (idle, forward, turn L/R, attack, forward+attack, turn+attack) to reduce motion noise; Defend = medium (adds strafe±attack); Deadly = full 13 combos (adds strafe, backward+attack, run-and-gun variants). Loading a checkpoint into a wider head will drop the old actor head and reinit a new one; optimizer state is skipped in that case.
-- **Entropy scheduling:** Added `--ent-coef-warm`, `--ent-warm-steps`, `--ent-coef-final` to keep exploration high early (especially in Deadly) and decay later. Without this, policies collapse to deterministic rush/turn behaviors. Very low entropy (e.g., 0.0005) is being tested on Basic to force aim/shoot instead of spinning.
-- **Shaping knobs in play:** Besides kill/death/health/progress, we added `damage_reward` (per DAMAGECOUNT), `living_penalty` with `kill_grace_steps` (tiny or zero to avoid incentivizing suicide), `forward_penalty` gated on no recent kills (to discourage advancing while ignoring enemies), and optional `health_delta_scale` for symmetric health changes. Forward shaping is often set to 0 in Deadly to avoid rush policies.
-- **Observed failures:** At skill 5, Deadly often converges to “rush forward and die,” sometimes biased to one side, even with high kill/death rewards and zero progress reward. High entropy warm phases and frame_skip=1 help but have not fully broken the pattern. Evaluations must match the training shaping; default eval shaping can mask issues with inflated returns.
-- **Basic with combo actions:** Multiple runs (500k steps) still show wandering/spinning and negative episodic returns when entropy is moderate. Current mitigation is to slam entropy down (≤0.001) and raise kill/damage incentives (kill ≥10–20, damage_reward ~1.0) so the policy latches onto “face target + shoot.” If this fails, we will prune the Basic action set further (e.g., idle, turn L/R, attack, forward+attack only) to remove aimless motion.
-- **Action mapping fix:** The combo action matrices are now explicitly aligned with the shared button order (MOVE_FWD, MOVE_BACK, TURN_L, TURN_R, MOVE_L, MOVE_R, ATTACK). Misalignment previously caused the “attack” intent to trigger turns, leading to spinning. The Basic/Defend/Deadly sets were rebuilt accordingly.
-
-## Action Encoding & Combo Sets
-- **Why multi-hot combos?** ViZDoom exposes independent buttons (move/turn/strafe/attack). Using a one-hot over single buttons prevents “run-and-gun” behaviors and makes the policy head shape scenario-dependent. We switched to multi-hot combo rows so one discrete index can trigger several buttons at once (e.g., forward+attack), enabling strafe-shooting and turn-and-shoot behaviors that are critical in Deadly Corridor.
-- **What the vector means:** Each row in the combo matrix is a multi-hot vector over the shared buttons in fixed order `[MOVE_FORWARD, MOVE_BACKWARD, TURN_LEFT, TURN_RIGHT, MOVE_LEFT, MOVE_RIGHT, ATTACK]`. A 1 in a position means “press that Doom button this step.” For example, `[1,0,0,0,0,0,1]` means “move forward + attack.” ViZDoom’s `make_action` consumes this boolean list directly, so the encoding is exactly the set of buttons to press simultaneously.
-- **Shared button order:** We force a consistent button list via `SHARED_ACTION_BUTTONS` in `doom_ppo_deadly_corridor.py`: `[MOVE_FORWARD, MOVE_BACKWARD, TURN_LEFT, TURN_RIGHT, MOVE_LEFT, MOVE_RIGHT, ATTACK]`. This order is applied to the game (`set_available_buttons`) so the policy head and the Doom engine agree on indices.
-- **Scenario-specific combo sets (`--use-combo-actions`):**
-  - Basic: small, aim-focused set (idle; forward; turn L/R; attack; forward+attack; turn±attack) to reduce wander and teach “face + shoot.”
-  - Defend the Center: medium set adds strafe±attack to handle circle-strafing enemies.
-  - Deadly Corridor: full 13-action run-and-gun set (forward/back/strafe/turn combinations with attack) to cover all movement/shooting needs.
-  If combo actions are off, we fall back to an identity matrix over the available buttons.
-- **Checkpoint compatibility:** Keeping the shared button order means the actor head size is predictable. Changing the combo set size will reinit the actor head when loading a checkpoint into a different action count, but the base CNN/LSTM weights are reused. Keeping the same set across a curriculum stage avoids head resets.
-- **Config relationship:** The ViZDoom scenario `.cfg` files list available buttons, but we override them with `SHARED_ACTION_BUTTONS` to ensure consistency. Frame skip comes from the CLI (train) or the config (eval, currently fixed), so keep train/eval skip aligned to avoid control mismatch.
-- **Defend warm starts:** Defend-from-Basic LSTM checkpoints with vf_coef≈0.3–0.4 and modest entropy have behaved reasonably (scores ~50–70 shaped reward per episode), so we keep using Defend as the warm start for Deadly.
-- **Deadly corridor attempts:** With stronger combat shaping (kill up to 80, death up to 100, progress=0, health_penalty>0, ammo_penalty low) and the 13-action set, the agent still tends to short episodes, rushing or looking only one side. Value losses stay high and EV negative or near zero, indicating critic underfit and unstable returns. If skill 5 remains mandatory, consider (a) even higher early entropy warm (0.15–0.2 for ~200k steps), (b) zero/near-zero living/forward penalties, (c) more damage_reward and health_delta to bias toward engaging threats, and (d) a simplified action set for a short “aiming bootcamp” before re-expanding.
-- **Checkpoint compatibility:** When action-space size changes (e.g., 7→13), training now drops incompatible actor params and reinitializes the head; optimizer state is reset. Evaluation does the same with `strict=False` so checkpoints remain usable, but warm-start benefits for the actor logits are lost when the head size changes.
-- **Next planned tests:** Run Basic with a minimal action set and very low entropy + strong kill/damage reward to get a clean “face and shoot” prior; then Defend with the medium set; then Deadly with the full set, high-entropy warm phase, progress=0, high kill/death, modest damage_reward, and tiny/zero living/forward penalties. Keep doom_skill at 5 per current constraint; if plateau persists, temporarily lowering skill to teach clearing both sides is an option for later consideration.
-
-## Debugging Log: The 'Stuck Shooter' Problem on Basic Scenario
-
-This log details the step-by-step process of diagnosing and fixing a common reinforcement learning problem where the agent adopted a suboptimal, repetitive behavior instead of learning the intended task.
-
-### 1. The Initial Problem: Suboptimal Local Minimum
-
-- **Observation:** When training on the `basic` scenario, the agent learned to move to the side of the arena and shoot continuously at a wall. It was not actively pursuing or killing the enemy.
-- **Interpretation:** The agent found a "local minimum" in its policy. This behavior, while not optimal, was "safe" and produced a consistent (though not good) outcome according to its flawed understanding of the environment. It learned that shooting was an action, but not how to connect that action to a successful outcome.
-
-### 2. Diagnosis Part 1: Sparse Rewards
-
-- **Investigation:** The initial training logs for the `basic` scenario showed the following reward shaping: `(kill=20.0, ammo_penalty=0.0075, ...)` and crucially, no `damage_reward`.
-- **Diagnosis:** This is a **sparse reward** problem. The agent only received a large positive reward upon successfully *killing* an enemy. Kills are infrequent for an untrained agent, so there can be hundreds of actions between rewards. This makes the **credit assignment problem** nearly impossible to solve; the agent cannot determine which of its many past actions were responsible for the eventual reward.
-- **Theoretical Explanation:** The goal of a reinforcement learning agent is to maximize the expected future discounted reward, $G_t = \sum_{k=0}^{\infty} \gamma^k R_{t+k+1}$. If the reward $R$ is almost always zero, the agent gets no gradient signal to update its policy. By providing smaller, more frequent (i.e., "dense") rewards for intermediate steps that lead to the goal, we provide a much clearer learning signal.
-- **Solution:** We introduced a **dense reward** by adding `damage_reward=1.0` to the default shaping for the `basic` scenario. This provides an immediate positive reward for the action of successfully hitting an enemy, directly solving the credit assignment problem for aiming.
-
-### 3. Anomaly & Diagnosis Part 2: The Evaluation Mismatch
-
-- **Observation:** After training with the new `damage_reward`, an evaluation run showed catastrophically bad performance (e.g., rewards of -300). This was contrary to the slight improvement seen during training.
-- **Investigation:** We compared the log output from the training script and the evaluation script.
-  - Training log: `... damage_reward=1.0 ...`
-  - Evaluation log: `... damage_reward` was missing.
-- **Diagnosis:** A bug was found where the evaluation script (`eval_doom_agent.py`) was not correctly loading or logging the `damage_reward` from the scenario defaults. The agent was being trained in one environment (with damage rewards) and evaluated in another (without them). Its policy was nonsensical in the evaluation environment, leading to the terrible scores.
-- **Solution:** The `eval_doom_agent.py` script was patched to correctly apply and log all reward shaping parameters, ensuring the training and evaluation environments were identical.
-
-### 4. Diagnosis Part 3: Unstable Value Function (Critic Failure)
-
-- **Observation:** After fixing the evaluation script, a new evaluation showed a "brittle" or unstable policy. In some episodes, the agent performed well and killed the enemy quickly. In others, it reverted to the old behavior of getting stuck. The skill was learned, but not applied reliably.
-- **Investigation:** We analyzed the training logs again, focusing on the `ExplainedVar` (Explained Variance) metric. Throughout the entire training run, `ExplainedVar` remained highly negative (e.g., -0.857 at the end).
-- **Diagnosis:** The core problem was an unstable **value function** (the "Critic" in our Actor-Critic model).
-- **Theoretical Explanation:** Explained Variance measures how well the Critic's predictions of future rewards match the actual rewards the agent received. A value of 1.0 is a perfect prediction; a negative value means the Critic's predictions are worse than simply guessing the average outcome. The PPO algorithm updates the policy (the "Actor") based on an "advantage" calculation, which is heavily dependent on the Critic's predictions (`Advantage ≈ Actual Reward - Predicted Reward`). If the Critic's predictions are garbage, the advantage calculation is also garbage, and the Actor receives a noisy, unreliable gradient. The agent literally cannot tell if its actions are leading to good or bad states.
-- **The PPO Loss Function:** The total loss is a combination of policy loss, value loss, and an entropy bonus: `Loss = Loss_policy + vf_coef * Loss_value - ent_coef * Loss_entropy`. In our case, `Loss_value` was massive and incorrect. Because it's part of the total loss, its huge, noisy gradients were likely overwhelming the smaller, more useful gradients from the policy and entropy losses, destabilizing the entire learning process.
-
-### 5. Current Solution: Stabilizing the Critic
-
-- **Solution:** To combat the unstable Critic, we are continuing training from the last checkpoint but with a significantly reduced **value function coefficient** (`--vf-coef 0.2`).
-- **Rationale:** By lowering `vf-coef`, we are reducing the weight of the `Loss_value` in the total loss function. This effectively tells the optimizer: "For now, don't trust the Critic's updates so much. Pay more attention to the Actor's updates, which are guided by the dense `damage_reward` we added." This should stabilize the shared layers of the neural network, allowing the policy to improve consistently while giving the critic more time to gradually learn a better value estimate from a more stable policy. The next training run's logs will be monitored for an increasing `ExplainedVar`, which will signal that this approach is working.
-
-- **Solution 2:** We implemented **Advantage Normalization (`--norm-adv`)**.
-  - **Advantage Normalization:** Advantages for the batch are normalized to mean 0, std 1 before the policy loss. This keeps policy updates scale-consistent.
-  - **Return Normalization:** **DISABLED**. We explicitly removed minibatch return normalization because it destroyed the Critic's ability to distinguish between high-reward and low-reward batches.
-- **Path Forward:** Retrain from the start (Basic → Defend → Deadly) with the new settings.
-
-
-## command use to run succesfully the basic training
-
-uv run python doom_ppo_deadly_corridor.py   --scenario-name basic   --exp-name basic_phase1_clean  --use-combo-actions   --use-lstm --lstm-hidden-size 512   --frame-skip 4   --num-envs 8 --num-steps 128 --num-minibatches 4   --total-timesteps 1500000 --learning-rate 2.5e-4  --ent-coef 0.015   --vf-coef 0.5   --norm-adv   --anneal-lr   --cuda   --track
-
-
-
-## Evaluation Cheat Sheet
-Use these commands to demonstrate the agent's progression through the curriculum. All commands include --sleep-per-step 0.05 for human-friendly viewing speeds.
+This section documents the chronological progression of the agent.
 
 ### Phase 1: Basic (The Foundation)
-Goal: Verify the agent can move and shoot. (Checkpoint fixed)
+**Goal:** Verify the agent can move and shoot stationary targets.
+*   **Command:**
+    ```bash
+    uv run python doom_ppo_deadly_corridor.py --scenario-cfg configs/basic.cfg --use-combo-actions --use-lstm --norm-adv --anneal-lr --ent-coef 0.01 --total-timesteps 1500000
+    ```
+*   **Results:**
+    *   **Mean Reward:** 100.96 (Max Possible: ~101)
+    *   **Entropy:** Decayed to 0.05 (Deterministic Policy)
+    *   **Value Loss:** ~0.3 (Stable Critic)
+*   **Interpretation:** The agent mastered the scenario, learning to immediately kill the monster. The low entropy indicates extreme confidence.
+*   **Technical Challenge:** The "Stuck Shooter" bug (see Section 6).
 
+### Phase 2: Defend the Center
+**Goal:** 360-degree aiming and turret behavior (encircled by enemies).
+*   **Command:**
+    ```bash
+    uv run python doom_ppo_deadly_corridor.py --scenario-cfg configs/defend_the_center.cfg --load-checkpoint checkpoints/basic_phase1...pt --total-timesteps 2000000
+    ```
+*   **Results:**
+    *   **Mean Reward:** ~60 (Max: ~111)
+    *   **Entropy:** ~0.7-0.8 (Healthy Exploration)
+*   **Interpretation:** Successfully transferred aiming skills. Hgher entropy was retained, allowing the agent to scan 360 degrees rather than collapsing into a single viewing direction.
+
+### Phase 3: Deadly Corridor (The Zig-Zag Maze)
+*   **Goal:** Navigate a corridor filled with enemies to reach a green vest.
+*   **Context:** This was the hardest transfer learning step, requiring a shift from "Turret" (Phase 2) to "Navigator" (Phase 3).
+*   **Iteration 3.1 (Failed): The "Rusher"**
+    *   *Settings:* High `progress_scale` (0.02), Moderate `kill_reward` (15.0).
+    *   *Result:* Agent ignored enemies, rushed forward, and died.
+    *   *Diagnosis:* The reward for moving forward outweighed the risk of death. The agent learned that "Distance = Points" before "Death = Stop".
+*   **Iteration 3.2 (Failed): The "Suicider" (Native Reward Trap)**
+    *   *Observation:* Agent vibrated in corners or rushed the first sector, receiving massive random rewards.
+    *   *Diagnosis:* Native WAD rewards (±20 point swings) created noise.
+    *   *Fix:* **Zero-Sum Pivot** (See Technical Deep Dive C). We silenced the engine (`base_reward=0.0`) to force the agent to obey only our Python curriculum.
+*   **Iteration 3.3 (Pivot): "Survival First"**
+    *   *Settings:* `progress_scale` lowered to 0.005. `kill_reward` raised to 30.0. `death_penalty` raised to 25.0.
+    *   *Result:* The agent learned it *must* clear the path to survive. Moving forward is only profitable if the threat is neutralized.
+*   **Iteration 3.4 (Architecture Fix): Action Space Compatibility**
+    *   *Problem:* Phase 2 had 3 actions, Phase 3 needed 7. Loading the checkpoint crashed the actor head.
+    *   *Solution:* Implemented the **Universal 7-Button Standard** (See Technical Deep Dive B) to allow checkpoint loading.
+*   **Iteration 3.5 (Final): "Corner Peeking"**
+    *   *Implementation:* Enabled **LSTM** (`--use-lstm`).
+    *   *Result:* The recurrent memory allowed the agent to handle partial observability ("I saw an imp around that corner 2 seconds ago"), leading to the "Slice the Pie" tactical behavior where it clears angles before advancing.
+
+### Phase 4: Health Gathering Supreme
+**Goal:** Survive in an acid maze (Survival only, no shooting).
+*   **Solution:** `living_penalty = -0.1` taught the agent that "Time = Health".
+*   **Result:** Mean Return ~22.0. The agent successfully learned navigation without combat.
+
+---
+
+### Phase 5: The Deathmatch Experiment (Detailed Logs)
+*This phase required extensive tuning of the agent's psychology/economy.*
+
+*   **Phase 5.1 (Failed): "The Wall Spam Incident"**
+    *   *Settings:* `ammo_penalty=0.0`.
+    *   *Observation:* Agent hoarded ammo and punched walls. Zero cost to exist led to lazy local optima.
+*   **Phase 5.2 - 5.6 (Failed): Economy Tuning**
+    *   Tried various penalties (`ammo_penalty`, `wall_penalty`). Agent became either a "Pacifist" (too afraid to shoot) or a "Camper" (hiding in rooms).
+*   **Phase 5.7 (Pivot): "The Revenge Mechanic" (Pain Rage)**
+    *   *Hypothesis:* Make getting hit explicitly trigger a "Berserker" state.
+    *   *Implementation:* `pain_rage_multiplier=4.0`. When damaged, kill rewards quadruple for 2 seconds.
+    *   *Result:* Created a "Kamikaze" agent that traded its life for rage points. It worked technically, but failed strategically.
+*   **Phase 5.10: "Robust Visualization"**
+    *   *Engineering Fix:* `GLX BadValue` errors prevented headless evaluation. We implemented a custom OpenCV render loop in `eval_doom_agent.py` to pipe the raw internal High-Res buffer to the screen, bypassing the native windowing system.
+*   **Phase 5.11: "The Arms Dealer"**
+    *   *Problem:* Agent ignored Rockets/Plasma.
+    *   *Solution:* Rebalanced economy. `ammo_reward` increased (0.05 -> 0.20), `kill_reward` decreased (15.0 -> 10.0).
+*   **Phase 5.12: "The Scavenger" (Universal Vision)**
+    *   *Problem:* Agent was "blind" to non-bullet ammo.
+    *   *Solution:* Modified `VizDoomGymnasiumEnv` to track `AMMO2`-`AMMO5`. Added **Panic Penalty** if `SELECTED_WEAPON_AMMO == 0`.
+*   **Phase 5.13: "The Matador" (Final Policy)**
+    *   *Problem:* "Rage" mechanic encouraged face-tanking.
+    *   *Solution:* **Disabled Rage** (`multiplier=1.0`). Increased `health_penalty` to **0.5**.
+    *   *Result:* Taking damage is now strictly net-negative. Agent finally learned to strafe and dodge while fighting.
+
+---
+
+## 4. Technical Challenges & Solutions
+
+### A. The 'Stuck Shooter' Debugging Log (Basic Scenario)
+*   **Observation:** Initial agent stood still and shot the wall.
+*   **Diagnosis (Sparse Reward):** Kills are rare events. The agent couldn't link the action of "aiming" to the delayed reward of "killing".
+*   **Solution:** Introduced **Dense Reward** (`damage_reward=1.0`). This provided immediate feedback for every bullet impact, effectively solving the credit assignment problem for aiming.
+
+### B. Action Space Mismatch (Curriculum Transfer)
+*   **Problem:** Transferring from `defend_the_center` (3 actions) to `deadly_corridor` (7 actions) crashed the Neural Net due to shape mismatches in the Actor Head.
+*   **Solution:** **Universal 7-Button Standard.**
+    We enforced a superset action space for ALL scenarios:
+    ```python
+    [MOVE_FORWARD, MOVE_BACKWARD, TURN_LEFT, TURN_RIGHT, MOVE_LEFT, MOVE_RIGHT, ATTACK]
+    ```
+    This ensures that weights from Phase 2 are fully compatible with Phase 3/5, enabling true Curriculum Learning.
+
+### C. The "Zero-Sum" Pivot: Silencing the Engine (Crucial)
+*   **Context:** Early in Phase 3 (Deadly Corridor), the agent exhibited bizarre behavior: suicide-rushing the first sector or vibrating in corners.
+*   **Investigation:** We discovered that the WAD file itself contained hidden ACS (Action Code Script) logic that dispensed rewards based on arbitrary sector crossings. These native rewards were massive (±20.0) compared to our shaping (0.01), creating a deafening "noise" that drowned out our learning signal.
+*   **The Crucial Fix:** We implemented a **"Python-First" Reward Authority**.
+    ```python
+    # In VizDoomGymnasiumEnv.step():
+    self.game.make_action(...)
+    
+    # CRITICAL: The Doom engine returns a reward based on internal WAD logic.
+    # We explicitly discard this to prevent "Exploding Reward" artifacts.
+    base_reward = 0.0 
+    
+    # We then construct the TOTAL reward strictly from our own calculated deltas:
+    reward = base_reward + shape_reward_func(...)
+    ```
+*   **Why this works:** By force-setting `base_reward = 0.0`, we effectively "deafen" the agent to the game designer's original intentions (which were meant for humans, not RL) and force it to listen **ONLY** to our curriculum (Kill, Survive, Scavenge). This was the turning point that allowed the agent to converge in complex scenarios.
+
+### D. Action Encoding & Combo Sets (Multi-Hot Architecture)
+*   **The Challenge:** ViZDoom exposes independent buttons (move, turn, shoot). A standard `OneHot` wrapper prevents "Run & Gun" behavior (e.g., you can't Move Forward + Shoot in the same tick).
+*   **The Solution:** We implemented a **Multi-Hot Combo Wrapper**.
+    *   Instead of picking 1 button, the agent picks 1 *row* from a pre-defined matrix of combos.
+    *   Example Row: `[1, 0, 0, 0, 0, 0, 1]` => `MOVE_FORWARD` + `ATTACK`.
+*   **Curriculum Standardization:**
+    To ensure checkpoints load across all phases, we forced a **Universal 7-Button Standard** (`SHARED_ACTION_BUTTONS`) across Basic, Defend, and Deadly Corridor.
+    *   `[FWD, BACK, TURN_L, TURN_R, MOVE_L, MOVE_R, ATK]`
+    *   This keeps the Policy Head size constant (N_logits) even as the scenario complexity grows, preventing shape mismatch errors during Transfer Learning.
+
+### D. Action Encoding & Combo Sets (Multi-Hot Architecture)
+*   **The Challenge:** ViZDoom exposes independent buttons (move, turn, shoot). A standard `OneHot` wrapper prevents "Run & Gun" behavior (e.g., you can't Move Forward + Shoot in the same tick).
+*   **The Solution:** We implemented a **Multi-Hot Combo Wrapper**.
+    *   Instead of picking 1 button, the agent picks 1 *row* from a pre-defined matrix of combos.
+    *   Example Row: `[1, 0, 0, 0, 0, 0, 1]` => `MOVE_FORWARD` + `ATTACK`.
+*   **Curriculum Standardization:**
+    To ensure checkpoints load across all phases, we forced a **Universal 7-Button Standard** (`SHARED_ACTION_BUTTONS`) across Basic, Defend, and Deadly Corridor.
+    *   `[FWD, BACK, TURN_L, TURN_R, MOVE_L, MOVE_R, ATK]`
+    *   This keeps the Policy Head size constant (N_logits) even as the scenario complexity grows, preventing shape mismatch errors during Transfer Learning.
+
+---
+
+## 5. Theoretical Framework: PPO & The Dual-Head Architecture
+
+### A. Proximal Policy Optimization (PPO)
+PPO is a policy gradient method that balances **sample efficiency** with **training stability**. Unlike "Vanilla" Policy Gradient (REINFORCE) which can suffer from destructive heavy updates, PPO constrains the update step to stay "proximal" (close) to the previous policy.
+
+**The Core Mechanism: Clipped Surrogate Objective**
+The PPO loss function is designed to prevent the new policy $\pi_\theta$ from diverging too far from the old policy $\pi_{\theta_{old}}$.
+$$L^{CLIP}(\theta) = \hat{\mathbb{E}}_t [\min(r_t(\theta)\hat{A}_t, \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon)\hat{A}_t)]$$
+
+*   $r_t(\theta)$ is the probability ratio: $\frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{old}}(a_t|s_t)}$.
+*   $\hat{A}_t$ is the **Advantage** (how much better this action was than average).
+*   $\epsilon$ is the clipping parameter (usually 0.1 or 0.2).
+
+**Why it matters for Doom:**
+In a chaotic environment like a Deathmatch, a single lucky frame could produce a massive reward signal (e.g., fragging 3 enemies). Without clipping, the gradient update would smash the network weights towards that specific lucky action, destroying the delicate visual filters learned so far. PPO's clipping ensures we learn *steadily* from the experience without overreacting.
+
+### B. The Dual-Head Architecture (Actor-Critic)
+Our agent is not just one network; it is two distinct "brains" sharing a single pair of eyes (the CNN Encoder).
+
+#### 1. The Encoder (The Eyes)
+*   **Input:** 4 Stacked Grayscale Frames (84x84x4).
+*   **Function:** Extracts spatial features (corners, enemies, walls) into a 512-dimensional latent vector.
+*   **Role:** Both the Actor and Critic rely on this shared understanding of "What am I looking at?".
+
+#### 2. The Actor Head (The Policy / $\pi_{\theta}$)
+*   **Type:** Categorical Distribution (Softmax).
+*   **Output:** A set of **Logits** (unnormalized scores), one for each valid Action Combo (0 to 6).
+*   **Process:**
+    1.  Receives the 512-d feature vector.
+    2.  Outputs 7 scores (e.g., `[FWD: 2.5, ATK: 0.1, ...`).
+    3.  **Training:** Samples stochastically based on probability (exploration).
+    4.  **Evaluation:** Takes the `argmax` (greedy exploitation).
+*   **Role:** "The Pilot". It decides *what to do* given the current view.
+
+#### 3. The Critic Head (The Value Function / $V(s)$)
+*   **Type:** Scalar Regressor (Linear layer).
+*   **Output:** A single floating-point number representing the **Expected Future Return** ($V(s)$) from the current state.
+*   **Training Signal:** Minimizes the Mean Squared Error (MSE) between its prediction and the actual rewards received (plus GAE bootstrap).
+*   **Role:** "The Coach". It tells the Actor how good the current situation is.
+    *   If the Actor takes an action and gets a reward, the Critic compares it to its expectation.
+    *   **Advantage Calculation:** $A = \text{Actual Reward} - V(s)$.
+    *   If $A > 0$ (result was better than expected), the Actor is encouraged to do it again.
+    *   If $A < 0$ (result was worse/disappointing), the Actor is discouraged.
+
+---
+
+## 6. Usage Guide
+
+### Prerequisites
+Values are managed via `uv`.
+```bash
+uv sync
+```
+
+### Training Command (Standard Template)
+```bash
+uv run python doom_ppo_deadly_corridor.py \
+    --scenario-cfg configs/deathmatch_simple.cfg \
+    --exp-name my_experiment \
+    --use-lstm --lstm-hidden-size 512 \
+    --cuda --track
+```
+
+### Evaluation Command (Standard Template)
+```bash
+uv run python eval_doom_agent.py \
+    --checkpoint checkpoints/my_checkpoint.pt \
+    --scenario-cfg configs/deathmatch_simple.cfg \
+    --use-lstm --render --cuda
+```
+
+---
+
+## 6. Evaluation Cheat Sheet (Final Verified Commands)
+*Use these commands to demonstrate the project's progression to an audience.*
+
+### Phase 1: Basic (The Foundation)
+**Goal:** Verify the agent can move and shoot.
+```bash
 uv run python eval_doom_agent.py \
     --checkpoint checkpoints/basic_phase1_clean_basic_lstm_2025-12-04_14-10-21_seed42_step1499136.pt \
     --scenario-name basic \
     --use-lstm --lstm-hidden-size 512 \
     --episodes 5 --render --cuda \
     --sleep-per-step 0.05 --damage-reward 1.0
+```
 
 ### Phase 2: Defend the Center
-Goal: Check 360-degree aiming and turret behavior.
-
+**Goal:** Check 360-degree aiming and turret behavior.
+```bash
 uv run python eval_doom_agent.py \
     --checkpoint checkpoints/defend_center_phase2_defend_the_center_lstm_2025-12-04_16-21-49_seed42_step1999872.pt \
     --scenario-name defend_the_center \
     --use-lstm --lstm-hidden-size 512 \
     --episodes 5 --render --cuda \
     --sleep-per-step 0.05
+```
 
 ### Phase 3: Deadly Corridor
-Goal: Survive the corridor and reach the vest.
-
+**Goal:** Survive the corridor and reach the vest.
+```bash
 uv run python eval_doom_agent.py \
     --checkpoint checkpoints/deadly_corridor_phase3_deadly_corridor_lstm_2025-12-04_23-06-15_seed42_step4999168.pt \
     --scenario-name deadly_corridor \
     --use-lstm --lstm-hidden-size 512 \
     --episodes 5 --render --cuda \
     --sleep-per-step 0.05
+```
 
 ### Phase 4: Health Gathering Supreme
-Goal: Verify navigation and healing logic (no shooting).
-
+**Goal:** Verify navigation and healing logic (no shooting).
+```bash
 uv run python eval_doom_agent.py \
     --checkpoint checkpoints/health_gathering_phase4_health_gathering_supreme_lstm_2025-12-05_11-54-11_seed42_step999424.pt \
     --scenario-cfg configs/health_gathering_supreme.cfg \
     --use-lstm --lstm-hidden-size 512 \
     --episodes 3 --render --cuda \
     --sleep-per-step 0.05
+```
 
 ### Phase 5.12: "The Scavenger" (Ammo Aware)
-Goal: Show the agent picking up different ammo types and managing panic. Note: This checkpoint tracks AMMO2/3/4/5 and has a Panic Penalty.
-
+**Goal:** Show the agent picking up different ammo types and managing panic.
+```bash
 uv run python eval_doom_agent.py \
     --checkpoint checkpoints/deathmatch_phase5_scavenger_fixed_deathmatch_simple_lstm_2025-12-09_00-08-11_seed42_step9999360.pt \
     --scenario-cfg configs/deathmatch_simple.cfg \
@@ -551,10 +305,11 @@ uv run python eval_doom_agent.py \
     --kill-reward 5.0 \
     --episodes 3 --render --cuda \
     --sleep-per-step 0.05
+```
 
 ### Phase 5.13: "The Matador" (Current Best)
-Goal: Demonstrate evasion. The agent should NOT Rage-face-tank but instead strafe/dodge. Note: Rage disabled, Pain is high.
-
+**Goal:** Demonstrate evasion. The agent should NOT Rage-face-tank but instead strafe/dodge.
+```bash
 uv run python eval_doom_agent.py \
     --checkpoint checkpoints/deathmatch_phase5_matador_deathmatch_simple_lstm_2025-12-09_12-31-04_seed42_step9999360.pt \
     --scenario-cfg configs/deathmatch_simple.cfg \
@@ -563,3 +318,4 @@ uv run python eval_doom_agent.py \
     --pain-rage-multiplier 1.0 \
     --episodes 5 --render --cuda \
     --sleep-per-step 0.05
+```
