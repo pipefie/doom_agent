@@ -32,22 +32,22 @@ class Args:
     scenario_path: str = "configs/deathmatch_simple.cfg"
 
     # Partimos con la base de lo aprendido en el segundo modo de juego del Doom
-    load_model: str = "doom_dqn_level5_skill4.pth"
+    load_model: str = "doom_dqn_level5_skill5.pth"
     use_pretrained: bool = True
 
-    total_timesteps: int = 1000000
+    total_timesteps: int = 10000000
     learning_rate: float = 2.5e-4
     
     # --- Argumentos específicos de DQN ---
     num_envs: int = 1  # DQN suele funcionar mejor con 1 env, pero soporta vectorizado
-    buffer_size: int = 25000  # Memoria de repetición
+    buffer_size: int = 100000  # Memoria de repetición
     gamma: float = 0.99
     tau: float = 1.0  # 1.0 = Hard update (copia total), < 1.0 = Soft update
     target_network_frequency: int = 1000  # Cada cuánto actualizamos la red objetivo
     batch_size: int = 32
-    start_e: float = 0.5       # Epsilon inicial (exploración 60%)
+    start_e: float = 0.6       # Epsilon inicial (exploración 60%)
     end_e: float = 0.01        # Epsilon final (5%)
-    exploration_fraction: float = 0.6  # % del entrenamiento para bajar epsilon
+    exploration_fraction: float = 0.5  # % del entrenamiento para bajar epsilon
     learning_starts: int = 10000  # Pasos aleatorios antes de empezar a entrenar
     train_frequency: int = 4      # Entrenar cada X pasos
 
@@ -256,6 +256,6 @@ if __name__ == "__main__":
 
     # Guardado final
     print("Guardando modelo DQN...")
-    torch.save(q_network.state_dict(), "doom_dqn_level5_skill5.pth")
+    torch.save(q_network.state_dict(), "doom_dqn_level5_final.pth")
     envs.close()
     writer.close()

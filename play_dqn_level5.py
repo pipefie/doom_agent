@@ -63,7 +63,7 @@ if __name__ == "__main__":
     model = QNetwork(env.action_space.n).to(device)
     
     # Cargar Pesos
-    model_path = "doom_dqn_level5_skill5.pth"
+    model_path = "doom_dqn_level5_final.pth"
     try:
         print(f"Intentando cargar {model_path}...")
         model.load_state_dict(torch.load(model_path, map_location=device))
