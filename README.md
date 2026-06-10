@@ -55,7 +55,7 @@ Implements a **Deep Q-Network** agent trained through a 5-level curriculum. The 
 
 **Trained model checkpoints included:** `doom_dqn_model.pth` through `doom_dqn_level5_final.pth` + individual skill checkpoints.
 
-📖 **[Full `mike` branch README →](./README_mike.md)**
+📖 **[Full `mike` branch README →](./README.md)**
 
 ---
 
